@@ -245,6 +245,30 @@ async def resolve_audio(source: str) -> str:
     return name
 
 
+_NODE_CACHE: dict[str, bool] = {}
+
+
+async def comfy_has_node(name: str) -> bool:
+    if name not in _NODE_CACHE:
+        try:
+            async with httpx.AsyncClient(timeout=15) as c:
+                r = await c.get(f"{COMFY_URL}/object_info/{name}")
+                _NODE_CACHE[name] = r.status_code == 200 and name in r.json()
+        except Exception:
+            return False
+    return _NODE_CACHE[name]
+
+
+async def prepare_speech(speech_audio: Optional[str]) -> Optional[str]:
+    """Resolve speech_audio to a ComfyUI input file, or raise with a clear message."""
+    if not speech_audio:
+        return None
+    if not await comfy_has_node("MiniMaxH3AddGuide"):
+        raise ValueError("this ComfyUI version has no MiniMaxH3AddGuide node; update ComfyUI "
+                         "or use reference_to_video(reference_audios=...) instead")
+    return await resolve_audio(speech_audio)
+
+
 async def submit(workflow: dict) -> str:
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.post(f"{COMFY_URL}/prompt", json={"prompt": workflow, "client_id": CLIENT_ID})
@@ -341,7 +365,7 @@ INSTRUCTIONS = (
         "(curl/python) or give the link to the user; reuse the returned image_ids in every shot. Use quality='draft' with 3-5 s "
         "clips for previews, standard/high only for final shots, and batch jobs that use the same "
         "tool together (switching between video tools and text_to_image reloads models, ~15 s). "
-        "To give a character a specific voice, make a 5-10 s sample with text_to_speech and pass its URL in reference_to_video(reference_audios=[...]); write the dialogue in the prompt and tag references as <Picture 1>, <Audio 1>. "
+        "For a character saying exact lines with lip-sync: make the line with text_to_speech, then pass its URL as speech_audio to image_to_video or reference_to_video (duration = speech length + ~1 s, quote the line in the prompt). reference_audios only sets the voice timbre. "
         "Results come back as download URLs. Typical times on draft quality with turbo: "
         "image ~5 s, 3-5 s video ~30-60 s; high quality / long clips take several minutes. "
         "Write prompts in English for best results; spoken dialogue may be in other languages."
@@ -402,6 +426,8 @@ async def image_to_video(
     seed: Optional[int] = None,
     turbo: bool = True,
     wait_seconds: int = 0,
+    speech_audio: Optional[str] = None,
+    speech_start_seconds: float = 0.0,
 ) -> dict:
     """Animate an image into a video with audio (MiniMax H3). The image is the first frame.
 
@@ -410,6 +436,13 @@ async def image_to_video(
     prompt: what happens next: motion, camera, sounds/dialogue.
     last_frame_image: optional image the clip should end on (first+last frame mode).
     aspect_ratio: "auto" matches the input image.
+    speech_audio: optional finished speech track (best: the URL returned by
+      text_to_speech). It is placed into the clip's soundtrack so the character's mouth
+      moves to THESE exact words (lip-sync). Set duration_seconds to the speech length
+      (text_to_speech returns duration_seconds) plus ~0.5-1 s; audio past the end is cut.
+      In the prompt say who is speaking and quote the line, e.g.
+      'The woman in the red apron looks at the camera and says: "..."'.
+    speech_start_seconds: when the speech starts in the clip (default 0).
     Returns job_id; poll get_job until status == "done"."""
     try:
         first, data = await resolve_image(image)
@@ -423,9 +456,15 @@ async def image_to_video(
         size = image_size(data)
         aspect = W.closest_aspect(*size) if size else "16:9"
     d, s = _clamp_duration(duration_seconds), _seed(seed)
+    try:
+        speech = await prepare_speech(speech_audio)
+    except Exception as e:
+        return {"status": "error", "error": f"could not use speech_audio: {e}"}
     wf = W.image_to_video(prompt.strip(), first, d, aspect, quality, s, turbo, last)
+    if speech:
+        W.add_speech_guide(wf, speech, speech_start_seconds)
     return await run_job(wf, {"tool": "image_to_video", "seed": s, "duration_seconds": d,
-                              "aspect_ratio": aspect}, wait_seconds)
+                              "aspect_ratio": aspect, "lip_sync": bool(speech)}, wait_seconds)
 
 
 @mcp.tool()
@@ -439,6 +478,8 @@ async def reference_to_video(
     turbo: bool = True,
     wait_seconds: int = 0,
     reference_audios: Optional[list[str]] = None,
+    speech_audio: Optional[str] = None,
+    speech_start_seconds: float = 0.0,
 ) -> dict:
     """Create a new video with audio that features the people/objects/styles from 1-9
     reference images (MiniMax H3 Ref2VA). Unlike image_to_video, the references are not the
@@ -451,6 +492,14 @@ async def reference_to_video(
       character's voice). Also accepts http(s) URLs, data URIs or base64 audio. Total is
       trimmed to 15 s. The model speaks the dialogue written in the prompt in that voice,
       with matching lip movement; it does not replay the sample word for word.
+      For exact words + lip-sync use speech_audio instead (or as well).
+    speech_audio: optional finished speech track (best: the URL returned by
+      text_to_speech). It is placed into the clip's soundtrack so the character's mouth
+      moves to THESE exact words (lip-sync). Set duration_seconds to the speech length
+      (text_to_speech returns duration_seconds) plus ~0.5-1 s; audio past the end is cut.
+      In the prompt say who is speaking and quote the line, e.g.
+      'The woman in the red apron looks at the camera and says: "..."'.
+    speech_start_seconds: when the speech starts in the clip (default 0).
     prompt: the scene. Refer to references with tags in order: <Picture 1>, <Picture 2> ...
       for images and <Audio 1> ... for audios, e.g.
       '<Picture 1> looks at the camera and says in Thai: "สวัสดีครับ" in the voice of <Audio 1>.'
@@ -472,9 +521,16 @@ async def reference_to_video(
     except Exception as e:
         return {"status": "error", "error": f"could not load audio: {e}"}
     d, s = _clamp_duration(duration_seconds), _seed(seed)
+    try:
+        speech = await prepare_speech(speech_audio)
+    except Exception as e:
+        return {"status": "error", "error": f"could not use speech_audio: {e}"}
     wf = W.reference_to_video(prompt.strip(), names, d, aspect_ratio, quality, s, turbo, audio_names)
+    if speech:
+        W.add_speech_guide(wf, speech, speech_start_seconds)
     return await run_job(wf, {"tool": "reference_to_video", "seed": s, "duration_seconds": d,
-                              "references": len(names), "reference_audios": len(audio_names)},
+                              "references": len(names), "reference_audios": len(audio_names),
+                              "lip_sync": bool(speech)},
                          wait_seconds)
 
 

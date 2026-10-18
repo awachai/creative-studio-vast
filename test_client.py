@@ -44,18 +44,25 @@ async def main():
             print("[tools]", ", ".join(t.name for t in tools.tools))
             show("server_status", await s.call_tool("server_status", {}))
             img = await run(s, "text_to_image", "text_to_image", {
-                "prompt": "A cozy Thai street food stall at night, warm lanterns, steam rising from a wok, photorealistic",
-                "aspect_ratio": "16:9", "quality": "draft", "wait_seconds": 45})
+                "prompt": ("A friendly Thai woman street food cook in a red apron facing the camera, medium close-up, "
+                           "night market stall, warm lanterns, steam from a wok, photorealistic") if VOICE else
+                          "A cozy Thai street food stall at night, warm lanterns, steam rising from a wok, photorealistic",
+                "aspect_ratio": "16:9", "quality": "standard" if VOICE else "draft", "wait_seconds": 45})
             if VOICE and img.get("outputs"):
+                line = "วันนี้ผัดไทยร้อน ๆ พร้อมเสิร์ฟแล้วค่ะ ใครหิวมาทางนี้เลย"
+                voices = show("list_voices", await s.call_tool("list_voices", {"search": "Thai", "limit": 5}))
+                ids = [v["voice_id"] for v in voices.get("voices", []) if v.get("voice_id")]
+                vid = next((i for i in ids if "female" in i.lower()), ids[0] if ids else None)
                 tts = show("text_to_speech", await s.call_tool("text_to_speech", {
-                    "text": "สวัสดีครับ วันนี้ผัดไทยร้อน ๆ พร้อมเสิร์ฟแล้ว ใครหิวมาทางนี้เลยครับ", "language": "Thai"}))
+                    "text": line, "language": "Thai", **({"voice_id": vid} if vid else {})}))
                 if tts.get("outputs"):
-                    await run(s, "reference_to_video+voice", "reference_to_video", {
-                        "reference_images": [img["outputs"][0]["url"]],
-                        "reference_audios": [tts["outputs"][0]["url"]],
-                        "prompt": "The cook at <Picture 1> looks at the camera, smiles and says in Thai: "
-                                  "\"วันนี้ผัดไทยร้อน ๆ พร้อมเสิร์ฟแล้วครับ\" in the voice of <Audio 1>. Sizzling wok sounds.",
-                        "duration_seconds": 5, "quality": "draft"})
+                    speech = tts["outputs"][0]
+                    await run(s, "image_to_video+lipsync", "image_to_video", {
+                        "image": img["outputs"][0]["url"], "speech_audio": speech["url"],
+                        "duration_seconds": round(speech.get("duration_seconds", 4) + 1, 1),
+                        "prompt": "Close-up of the street food cook looking at the camera, smiling and "
+                                  f"speaking Thai: \"{line}\". Wok sizzling softly in the background.",
+                        "quality": "standard"})
             if FULL and img.get("outputs"):
                 url = img["outputs"][0]["url"]
                 await run(s, "image_to_video", "image_to_video", {

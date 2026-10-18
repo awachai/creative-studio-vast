@@ -93,6 +93,17 @@ def _apply_video_params(wf, duration, aspect, quality, seed, turbo):
     return wf
 
 
+def add_speech_guide(wf, audio_name, start_seconds=0.0) -> dict:
+    """Anchor a finished speech track (e.g. MiniMax TTS) into the clip's soundtrack starting at
+    start_seconds, so the model animates the mouth to that exact audio (MiniMaxH3AddGuide)."""
+    wf["speech_audio"] = {"class_type": "LoadAudio", "inputs": {"audio": audio_name}}
+    wf["speech_guide"] = {"class_type": "MiniMaxH3AddGuide", "inputs": {
+        "positive": ["h3", 0], "latent": ["h3", 1], "audio_vae": ["vae_a", 0],
+        "audio": ["speech_audio", 0], "frame_idx": max(0, int(round(float(start_seconds) * 24)))}}
+    wf["guider"]["inputs"]["conditioning"] = ["speech_guide", 0]
+    return wf
+
+
 def text_to_video(prompt, duration, aspect, quality, seed, turbo) -> dict:
     wf = _h3_common(FL2VA, FL2V_TURBO, 8, "h3")
     wf["h3"] = {"class_type": "MiniMaxH3ImageToVideo", "inputs": {
