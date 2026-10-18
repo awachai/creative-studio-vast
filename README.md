@@ -6,7 +6,7 @@
 |---|---|---|
 | `text_to_video` | ข้อความ → วิดีโอพร้อมเสียง (MiniMax H3) | GPU เครื่องเช่า |
 | `image_to_video` | ภาพ (เฟรมแรก/เฟรมสุดท้าย) → วิดีโอพร้อมเสียง | GPU เครื่องเช่า |
-| `reference_to_video` | ภาพอ้างอิง 1–9 ภาพ → วิดีโอที่มีตัวละคร/ของในภาพ | GPU เครื่องเช่า |
+| `reference_to_video` | ภาพอ้างอิง 1–9 ภาพ (+ เสียงต้นแบบ 1–3 ไฟล์) → วิดีโอที่มีตัวละคร/ของในภาพ พูดด้วยน้ำเสียงที่กำหนด | GPU เครื่องเช่า |
 | `text_to_image` | ข้อความ → ภาพนิ่ง (Z-Image-Turbo) | GPU เครื่องเช่า |
 | `text_to_speech`, `list_voices`, `design_voice` | เสียงพูด (MiniMax Speech) | MiniMax API |
 | `get_job`, `list_recent_outputs`, `server_status` | เช็กงาน/ผลลัพธ์/สถานะเครื่อง | — |
@@ -53,5 +53,5 @@
 - เลิกใช้สั้น ๆ: **Stop** (ไฟล์อยู่ครบ เสียค่าดิสก์ ~$0.04/ชม.) → เปิดใหม่แล้วรัน `bash /workspace/h3-mcp/start.sh` (ลิงก์เปลี่ยน)
 - เลิกใช้นาน: **Delete** แล้วเช่าใหม่จาก template
 - แก้โค้ดแล้ว: `bash /workspace/h3-mcp/restart_server.sh`
-- ทดสอบ: `cd /workspace/h3-mcp && venv/bin/python test_client.py --full`
+- ทดสอบ: `cd /workspace/h3-mcp && venv/bin/python test_client.py --full` (`--voice` = ทดสอบเสียงต้นแบบ)
 - ห้ามเปิดเผยไฟล์ `token`, `minimax.env`, `oauth_state.json`

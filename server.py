@@ -50,6 +50,9 @@ COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:18188").rstrip("/")
 COMFY_OUTPUT_DIR = Path(os.environ.get("COMFY_OUTPUT_DIR", "/workspace/ComfyUI/output"))
 COMFY_INPUT_DIR = Path(os.environ.get("COMFY_INPUT_DIR", "/workspace/ComfyUI/input"))
 ASSET_PREFIX = "asset:"
+# Cloudflare tunnel cuts a request at ~100 s and MCP clients time out around 60 s,
+# so a single call never blocks longer than this; callers simply call get_job again.
+MAX_WAIT = 45
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8765"))
@@ -187,6 +190,61 @@ def _ticket_ok(ticket: str) -> bool:
     return exp >= time.time() and hmac.compare_digest(ticket, _upload_ticket(exp))
 
 
+def _audio_ext(data: bytes) -> Optional[str]:
+    if data[:3] == b"ID3" or (len(data) > 1 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0):
+        return "mp3"
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "wav"
+    if data[:4] == b"fLaC":
+        return "flac"
+    if data[:4] == b"OggS":
+        return "ogg"
+    if data[4:8] == b"ftyp":
+        return "m4a"
+    return None
+
+
+async def resolve_audio(source: str) -> str:
+    """Turn an audio reference into a ComfyUI input filename.
+    Accepts: a URL returned by this server (e.g. from text_to_speech; read from local disk),
+    'asset:<name>' of an audio file already in the input folder, any http(s) URL, a data URI,
+    or base64 (mp3/wav/flac/ogg/m4a, max 25 MB)."""
+    s = (source or "").strip()
+    if s.startswith(ASSET_PREFIX):
+        name = Path(s[len(ASSET_PREFIX):]).name
+        if not (COMFY_INPUT_DIR / name).is_file():
+            raise ValueError(f"unknown audio id {s}")
+        return name
+    data = None
+    if PUBLIC_URL and s.startswith(f"{PUBLIC_URL}/files/"):
+        m = re.match(r"^/files/([^/]+)/([^?]+)", s[len(PUBLIC_URL):])
+        if m:
+            sub, fn = unquote(m.group(1)), Path(unquote(m.group(2))).name
+            path = COMFY_OUTPUT_DIR / ("" if sub == "_" else Path(sub).name) / fn
+            if path.is_file():
+                data = path.read_bytes()
+    if data is None:
+        if s.startswith(("http://", "https://")):
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as c:
+                r = await c.get(s)
+                r.raise_for_status()
+                data = r.content
+        else:
+            try:
+                data = base64.b64decode(s.split(",", 1)[1] if s.startswith("data:") else s, validate=False)
+            except binascii.Error as e:
+                raise ValueError(f"audio is neither a URL nor valid base64: {e}")
+    if not data or len(data) > MAX_INPUT_BYTES:
+        raise ValueError("audio is empty or larger than 25 MB")
+    ext = _audio_ext(data)
+    if not ext:
+        raise ValueError("unrecognised audio format (use mp3, wav, flac, ogg or m4a)")
+    name = f"audio_{uuid.uuid4().hex[:10]}.{ext}"
+    COMFY_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    (COMFY_INPUT_DIR / name).write_bytes(data)
+    return name
+
+
 async def submit(workflow: dict) -> str:
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.post(f"{COMFY_URL}/prompt", json={"prompt": workflow, "client_id": CLIENT_ID})
@@ -244,7 +302,7 @@ async def run_job(workflow: dict, info: dict, wait_seconds: int) -> dict:
     except Exception as e:
         return {"status": "error", "error": str(e)}
     result = {"job_id": job_id, "status": "queued", **info}
-    wait = max(0, min(600, int(wait_seconds or 0)))
+    wait = max(0, min(MAX_WAIT, int(wait_seconds or 0)))
     if wait:
         deadline = time.monotonic() + wait
         while time.monotonic() < deadline:
@@ -278,11 +336,12 @@ INSTRUCTIONS = (
         "Private creative studio on a GPU server. Video tools (MiniMax H3) create clips WITH "
         "synchronized audio, so describe sounds and dialogue in the prompt. Image tool uses "
         "Z-Image-Turbo. Speech uses MiniMax Speech. GPU jobs are asynchronous: call the tool, then "
-        "call get_job(job_id) — it waits until the job finishes (up to 60 s per call by default). "
+        "call get_job(job_id) — it waits until the job finishes (up to 45 s per call; just call it again while queued/running — a 10 s high-quality clip takes several minutes). "
         "NEVER type base64 for image files: call get_upload_url and send the files with code "
         "(curl/python) or give the link to the user; reuse the returned image_ids in every shot. Use quality='draft' with 3-5 s "
         "clips for previews, standard/high only for final shots, and batch jobs that use the same "
         "tool together (switching between video tools and text_to_image reloads models, ~15 s). "
+        "To give a character a specific voice, make a 5-10 s sample with text_to_speech and pass its URL in reference_to_video(reference_audios=[...]); write the dialogue in the prompt and tag references as <Picture 1>, <Audio 1>. "
         "Results come back as download URLs. Typical times on draft quality with turbo: "
         "image ~5 s, 3-5 s video ~30-60 s; high quality / long clips take several minutes. "
         "Write prompts in English for best results; spoken dialogue may be in other languages."
@@ -323,7 +382,7 @@ async def text_to_video(
 
     prompt: scene, subject, action, lighting, camera movement, sounds/dialogue.
     duration_seconds: 1-15. quality: draft (~864x480) / standard / high (~1280x720).
-    turbo: 8-step LoRA, much faster. wait_seconds: block up to N s (max 600) for the result.
+    turbo: 8-step LoRA, much faster. wait_seconds: block up to N s (max 45) for the result.
     Returns job_id; poll get_job until status == "done"."""
     if not prompt.strip():
         return {"status": "error", "error": "prompt is empty"}
@@ -379,6 +438,7 @@ async def reference_to_video(
     seed: Optional[int] = None,
     turbo: bool = True,
     wait_seconds: int = 0,
+    reference_audios: Optional[list[str]] = None,
 ) -> dict:
     """Create a new video with audio that features the people/objects/styles from 1-9
     reference images (MiniMax H3 Ref2VA). Unlike image_to_video, the references are not the
@@ -386,10 +446,20 @@ async def reference_to_video(
 
     reference_images: list of image_ids from upload_image ("asset:...", preferred),
       URLs returned by this server, http(s) URLs, data URIs, or base64 images, in order.
-    prompt: the scene; refer to references by what they show (e.g. "the boy in the red cape").
+    reference_audios: optional 1-3 voice samples that set HOW a character sounds (timbre,
+      way of speaking). Best: the URL returned by text_to_speech (a clear 5-10 s line in the
+      character's voice). Also accepts http(s) URLs, data URIs or base64 audio. Total is
+      trimmed to 15 s. The model speaks the dialogue written in the prompt in that voice,
+      with matching lip movement; it does not replay the sample word for word.
+    prompt: the scene. Refer to references with tags in order: <Picture 1>, <Picture 2> ...
+      for images and <Audio 1> ... for audios, e.g.
+      '<Picture 1> looks at the camera and says in Thai: "สวัสดีครับ" in the voice of <Audio 1>.'
     Returns job_id; poll get_job until status == "done"."""
     if not 1 <= len(reference_images) <= 9:
         return {"status": "error", "error": "provide between 1 and 9 reference images"}
+    reference_audios = [a for a in (reference_audios or []) if a]
+    if len(reference_audios) > 3:
+        return {"status": "error", "error": "provide at most 3 reference audios"}
     try:
         names = []
         for src in reference_images:
@@ -397,10 +467,15 @@ async def reference_to_video(
             names.append(name)
     except Exception as e:
         return {"status": "error", "error": f"could not load image: {e}"}
+    try:
+        audio_names = [await resolve_audio(a) for a in reference_audios]
+    except Exception as e:
+        return {"status": "error", "error": f"could not load audio: {e}"}
     d, s = _clamp_duration(duration_seconds), _seed(seed)
-    wf = W.reference_to_video(prompt.strip(), names, d, aspect_ratio, quality, s, turbo)
+    wf = W.reference_to_video(prompt.strip(), names, d, aspect_ratio, quality, s, turbo, audio_names)
     return await run_job(wf, {"tool": "reference_to_video", "seed": s, "duration_seconds": d,
-                              "references": len(names)}, wait_seconds)
+                              "references": len(names), "reference_audios": len(audio_names)},
+                         wait_seconds)
 
 
 @mcp.tool()
@@ -604,12 +679,12 @@ async def list_assets(search: Optional[str] = None, limit: int = 50) -> dict:
 
 
 @mcp.tool()
-async def get_job(job_id: str, wait_seconds: int = 60) -> dict:
+async def get_job(job_id: str, wait_seconds: int = 45) -> dict:
     """Check a GPU job from text_to_video / image_to_video / reference_to_video /
-    text_to_image. Waits up to wait_seconds (default 60, max 600) and returns as soon as the
+    text_to_image. Waits up to wait_seconds (default 45, max 45; larger values are capped) and returns as soon as the
     job finishes, so call it again only if status is still queued/running.
     status: queued, running, done, error. When done, 'outputs' holds URLs."""
-    deadline = time.monotonic() + max(0, min(600, int(wait_seconds or 0)))
+    deadline = time.monotonic() + max(0, min(MAX_WAIT, int(wait_seconds or 0)))
     while True:
         st = await job_status(job_id)
         if st["status"] in ("done", "error", "unknown") or time.monotonic() >= deadline:

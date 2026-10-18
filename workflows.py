@@ -114,7 +114,12 @@ def image_to_video(prompt, image_name, duration, aspect, quality, seed, turbo,
     return _apply_video_params(wf, duration, aspect, quality, seed, turbo)
 
 
-def reference_to_video(prompt, image_names, duration, aspect, quality, seed, turbo) -> dict:
+# Ref2VA accepts at most 15 s of reference audio in total.
+REF_AUDIO_TOTAL_SECONDS = 15.0
+
+
+def reference_to_video(prompt, image_names, duration, aspect, quality, seed, turbo,
+                       audio_names=()) -> dict:
     wf = _h3_common(REF2VA, REF2V_TURBO, 4, "h3")
     inputs = {
         "prompt": prompt, "width": ["res", 0], "height": ["res", 1], "length": ["length", 1],
@@ -122,6 +127,13 @@ def reference_to_video(prompt, image_names, duration, aspect, quality, seed, tur
     for i, name in enumerate(image_names):
         wf[f"ref_{i}"] = {"class_type": "LoadImage", "inputs": {"image": name}}
         inputs[f"ref_images.ref_image_{i}"] = [f"ref_{i}", 0]
+    if audio_names:
+        per_clip = round(REF_AUDIO_TOTAL_SECONDS / len(audio_names), 2)
+        for i, name in enumerate(audio_names):
+            wf[f"aud_{i}"] = {"class_type": "LoadAudio", "inputs": {"audio": name}}
+            wf[f"aud_trim_{i}"] = {"class_type": "TrimAudioDuration", "inputs": {
+                "audio": [f"aud_{i}", 0], "start_index": 0.0, "duration": per_clip}}
+            inputs[f"ref_audios.ref_audio_{i}"] = [f"aud_trim_{i}", 0]
     wf["h3"] = {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": inputs}
     return _apply_video_params(wf, duration, aspect, quality, seed, turbo)
 
