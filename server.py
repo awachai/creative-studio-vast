@@ -29,11 +29,12 @@ import hmac
 import io
 import os
 import random
+import re
 import time
 import uuid
 from pathlib import Path
 from typing import Literal, Optional
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import httpx
 import uvicorn
@@ -47,6 +48,8 @@ from oauth import SCOPE, OwnerOAuthProvider
 MCP_TOKEN = os.environ.get("MCP_TOKEN", "")
 COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:18188").rstrip("/")
 COMFY_OUTPUT_DIR = Path(os.environ.get("COMFY_OUTPUT_DIR", "/workspace/ComfyUI/output"))
+COMFY_INPUT_DIR = Path(os.environ.get("COMFY_INPUT_DIR", "/workspace/ComfyUI/input"))
+ASSET_PREFIX = "asset:"
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8765"))
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
@@ -120,14 +123,46 @@ def image_size(data: bytes) -> Optional[tuple[int, int]]:
         return None
 
 
-async def upload_image(data: bytes, ext: str) -> str:
-    name = f"mcp_{uuid.uuid4().hex[:12]}.{ext}"
+async def upload_image_bytes(data: bytes, ext: str, label: Optional[str] = None) -> str:
+    slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", label or "").strip("_")[:40]
+    name = f"asset_{slug + '_' if slug else ''}{uuid.uuid4().hex[:8]}.{ext}"
     async with httpx.AsyncClient(timeout=60) as c:
         r = await c.post(f"{COMFY_URL}/upload/image",
                          files={"image": (name, data, f"image/{'jpeg' if ext == 'jpg' else ext}")},
                          data={"type": "input", "overwrite": "true"})
         r.raise_for_status()
         return r.json()["name"]
+
+
+def _ext_of(data: bytes) -> str:
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return "png"
+
+
+async def resolve_image(source: str) -> tuple[str, bytes]:
+    """Turn an image reference into a ComfyUI input filename (uploading only if needed).
+    Accepts: 'asset:<name>' from upload_image, a download URL produced by this server
+    (read straight from local disk), any http(s) URL, a data URI, or base64."""
+    s = (source or "").strip()
+    if s.startswith(ASSET_PREFIX):
+        name = Path(s[len(ASSET_PREFIX):]).name
+        path = COMFY_INPUT_DIR / name
+        if not path.is_file():
+            raise ValueError(f"unknown image_id {s} (use list_assets to see available ids)")
+        return name, path.read_bytes()
+    if PUBLIC_URL and s.startswith(f"{PUBLIC_URL}/files/"):
+        m = re.match(r"^/files/([^/]+)/([^?]+)", s[len(PUBLIC_URL):])
+        if m:
+            sub, fn = unquote(m.group(1)), Path(unquote(m.group(2))).name
+            path = COMFY_OUTPUT_DIR / ("" if sub == "_" else Path(sub).name) / fn
+            if path.is_file():
+                data = path.read_bytes()
+                return await upload_image_bytes(data, _ext_of(data)), data
+    data, ext = await load_input_image(s)
+    return await upload_image_bytes(data, ext), data
 
 
 async def submit(workflow: dict) -> str:
@@ -221,7 +256,11 @@ INSTRUCTIONS = (
         "Private creative studio on a GPU server. Video tools (MiniMax H3) create clips WITH "
         "synchronized audio, so describe sounds and dialogue in the prompt. Image tool uses "
         "Z-Image-Turbo. Speech uses MiniMax Speech. GPU jobs are asynchronous: call the tool, then "
-        "poll get_job(job_id) every 10-20 s until status is 'done' (or pass wait_seconds). "
+        "call get_job(job_id) — it waits until the job finishes (up to 60 s per call by default). "
+        "Upload recurring images (characters, products, first frames) ONCE with upload_image and "
+        "reuse the returned image_id instead of re-sending base64. Use quality='draft' with 3-5 s "
+        "clips for previews, standard/high only for final shots, and batch jobs that use the same "
+        "tool together (switching between video tools and text_to_image reloads models, ~15 s). "
         "Results come back as download URLs. Typical times on draft quality with turbo: "
         "image ~5 s, 3-5 s video ~30-60 s; high quality / long clips take several minutes. "
         "Write prompts in English for best results; spoken dialogue may be in other languages."
@@ -285,18 +324,17 @@ async def image_to_video(
 ) -> dict:
     """Animate an image into a video with audio (MiniMax H3). The image is the first frame.
 
-    image: http(s) URL, data URI, or base64 of a PNG/JPG/WebP (max 25 MB).
+    image: an image_id from upload_image ("asset:..."; preferred, no re-upload), a URL
+      returned by this server, any http(s) URL, a data URI, or base64 (max 25 MB).
     prompt: what happens next: motion, camera, sounds/dialogue.
     last_frame_image: optional image the clip should end on (first+last frame mode).
     aspect_ratio: "auto" matches the input image.
     Returns job_id; poll get_job until status == "done"."""
     try:
-        data, ext = await load_input_image(image)
-        first = await upload_image(data, ext)
+        first, data = await resolve_image(image)
         last = None
         if last_frame_image:
-            ldata, lext = await load_input_image(last_frame_image)
-            last = await upload_image(ldata, lext)
+            last, _ = await resolve_image(last_frame_image)
     except Exception as e:
         return {"status": "error", "error": f"could not load image: {e}"}
     aspect = aspect_ratio
@@ -324,7 +362,8 @@ async def reference_to_video(
     reference images (MiniMax H3 Ref2VA). Unlike image_to_video, the references are not the
     first frame; they define who/what appears.
 
-    reference_images: list of http(s) URLs, data URIs, or base64 images, in order.
+    reference_images: list of image_ids from upload_image ("asset:...", preferred),
+      URLs returned by this server, http(s) URLs, data URIs, or base64 images, in order.
     prompt: the scene; refer to references by what they show (e.g. "the boy in the red cape").
     Returns job_id; poll get_job until status == "done"."""
     if not 1 <= len(reference_images) <= 9:
@@ -332,8 +371,8 @@ async def reference_to_video(
     try:
         names = []
         for src in reference_images:
-            data, ext = await load_input_image(src)
-            names.append(await upload_image(data, ext))
+            name, _ = await resolve_image(src)
+            names.append(name)
     except Exception as e:
         return {"status": "error", "error": f"could not load image: {e}"}
     d, s = _clamp_duration(duration_seconds), _seed(seed)
@@ -491,10 +530,51 @@ async def design_voice(
 
 
 @mcp.tool()
-async def get_job(job_id: str) -> dict:
+async def upload_image(image: str, label: Optional[str] = None) -> dict:
+    """Upload an image ONCE and get a reusable image_id ("asset:...").
+    Use it for characters, products, locations, first/last frames that appear in many
+    shots: pass the image_id to image_to_video (image / last_frame_image) or
+    reference_to_video (reference_images) instead of re-sending base64 every call.
+
+    image: base64, data URI, or http(s) URL (max 25 MB).
+    label: short name to recognise it later, e.g. "noori", "punti", "kitchen_scene"."""
+    try:
+        data, ext = await load_input_image(image)
+        name = await upload_image_bytes(data, ext, label)
+    except Exception as e:
+        return {"status": "error", "error": f"could not load image: {e}"}
+    size = image_size(data)
+    out = {"status": "done", "image_id": f"{ASSET_PREFIX}{name}", "bytes": len(data)}
+    if size:
+        out["width"], out["height"] = size
+    return out
+
+
+@mcp.tool()
+async def list_assets(search: Optional[str] = None, limit: int = 50) -> dict:
+    """List images previously uploaded with upload_image (newest first), with their image_ids."""
+    files = [p for p in COMFY_INPUT_DIR.glob("asset_*") if p.is_file()]
+    files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    if search:
+        files = [p for p in files if search.lower() in p.name.lower()]
+    items = [{"image_id": f"{ASSET_PREFIX}{p.name}", "bytes": p.stat().st_size,
+              "uploaded": time.strftime("%Y-%m-%d %H:%M", time.gmtime(p.stat().st_mtime)) + " UTC"}
+             for p in files[: max(1, min(500, int(limit)))]]
+    return {"count": len(files), "assets": items}
+
+
+@mcp.tool()
+async def get_job(job_id: str, wait_seconds: int = 60) -> dict:
     """Check a GPU job from text_to_video / image_to_video / reference_to_video /
-    text_to_image. status: queued, running, done, error. When done, 'outputs' holds URLs."""
-    return await job_status(job_id)
+    text_to_image. Waits up to wait_seconds (default 60, max 600) and returns as soon as the
+    job finishes, so call it again only if status is still queued/running.
+    status: queued, running, done, error. When done, 'outputs' holds URLs."""
+    deadline = time.monotonic() + max(0, min(600, int(wait_seconds or 0)))
+    while True:
+        st = await job_status(job_id)
+        if st["status"] in ("done", "error", "unknown") or time.monotonic() >= deadline:
+            return st
+        await asyncio.sleep(2)
 
 
 @mcp.tool()
