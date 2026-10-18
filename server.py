@@ -40,7 +40,7 @@ import httpx
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
 import workflows as W
 from oauth import SCOPE, OwnerOAuthProvider
@@ -50,6 +50,7 @@ COMFY_URL = os.environ.get("COMFY_URL", "http://127.0.0.1:18188").rstrip("/")
 COMFY_OUTPUT_DIR = Path(os.environ.get("COMFY_OUTPUT_DIR", "/workspace/ComfyUI/output"))
 COMFY_INPUT_DIR = Path(os.environ.get("COMFY_INPUT_DIR", "/workspace/ComfyUI/input"))
 ASSET_PREFIX = "asset:"
+MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 MCP_PORT = int(os.environ.get("MCP_PORT", "8765"))
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
@@ -165,6 +166,27 @@ async def resolve_image(source: str) -> tuple[str, bytes]:
     return await upload_image_bytes(data, ext), data
 
 
+# ---------------------------------------------------------------------------
+# Temporary upload links (signed, expiring) — files go straight to disk, not via the LLM
+# ---------------------------------------------------------------------------
+def _upload_ticket(exp: int) -> str:
+    sig = hmac.new(MCP_TOKEN.encode(), f"upload:{exp}".encode(), hashlib.sha256).hexdigest()[:32]
+    return f"{exp}.{sig}"
+
+
+def _upload_url(exp: int) -> str:
+    return f"{PUBLIC_URL}/upload/{_upload_ticket(exp)}"
+
+
+def _ticket_ok(ticket: str) -> bool:
+    try:
+        exp_s, _ = ticket.split(".", 1)
+        exp = int(exp_s)
+    except Exception:
+        return False
+    return exp >= time.time() and hmac.compare_digest(ticket, _upload_ticket(exp))
+
+
 async def submit(workflow: dict) -> str:
     async with httpx.AsyncClient(timeout=30) as c:
         r = await c.post(f"{COMFY_URL}/prompt", json={"prompt": workflow, "client_id": CLIENT_ID})
@@ -257,8 +279,8 @@ INSTRUCTIONS = (
         "synchronized audio, so describe sounds and dialogue in the prompt. Image tool uses "
         "Z-Image-Turbo. Speech uses MiniMax Speech. GPU jobs are asynchronous: call the tool, then "
         "call get_job(job_id) — it waits until the job finishes (up to 60 s per call by default). "
-        "Upload recurring images (characters, products, first frames) ONCE with upload_image and "
-        "reuse the returned image_id instead of re-sending base64. Use quality='draft' with 3-5 s "
+        "NEVER type base64 for image files: call get_upload_url and send the files with code "
+        "(curl/python) or give the link to the user; reuse the returned image_ids in every shot. Use quality='draft' with 3-5 s "
         "clips for previews, standard/high only for final shots, and batch jobs that use the same "
         "tool together (switching between video tools and text_to_image reloads models, ~15 s). "
         "Results come back as download URLs. Typical times on draft quality with turbo: "
@@ -536,7 +558,8 @@ async def upload_image(image: str, label: Optional[str] = None) -> dict:
     shots: pass the image_id to image_to_video (image / last_frame_image) or
     reference_to_video (reference_images) instead of re-sending base64 every call.
 
-    image: base64, data URI, or http(s) URL (max 25 MB).
+    image: base64, data URI, or http(s) URL (max 25 MB). For files on disk prefer
+      get_upload_url + curl/python — typing base64 by hand is slow and can corrupt the file.
     label: short name to recognise it later, e.g. "noori", "punti", "kitchen_scene"."""
     try:
         data, ext = await load_input_image(image)
@@ -548,6 +571,23 @@ async def upload_image(image: str, label: Optional[str] = None) -> dict:
     if size:
         out["width"], out["height"] = size
     return out
+
+
+@mcp.tool()
+async def get_upload_url(minutes: int = 30) -> dict:
+    """Get a temporary upload URL for sending image FILES straight to the server by code,
+    instead of typing base64 into a tool call (much faster, never corrupts files).
+
+    Use it whenever the images are files on the user's computer or in your sandbox:
+      curl -s -F "file=@/path/nori.png" -F "label=nori" "<upload_url>"
+    (repeat -F "file=@..." to send several files at once; label applies to all of them).
+    Python: requests.post(upload_url, files={"file": open(path, "rb")}, data={"label": "nori"})
+    The JSON response lists the new image_ids ("asset:..."). The same URL opened in a browser
+    shows a drag-and-drop page, so you can also give it to the user. Valid for `minutes` (max 240)."""
+    m = max(1, min(240, int(minutes)))
+    url = _upload_url(int(time.time()) + m * 60)
+    return {"status": "done", "upload_url": url, "expires_in_minutes": m,
+            "curl_example": f'curl -s -F "file=@/path/to/image.png" -F "label=nori" "{url}"'}
 
 
 @mcp.tool()
@@ -637,6 +677,59 @@ async def files(request: Request):
         headers["Content-Length"] = resp.headers["content-length"]
     return StreamingResponse(body(), media_type=resp.headers.get("content-type", "application/octet-stream"),
                              headers=headers)
+
+
+UPLOAD_PAGE = """<!doctype html><html lang="th"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Creative Studio – Upload</title>
+<style>body{font-family:system-ui,sans-serif;background:#111;color:#eee;max-width:640px;margin:40px auto;padding:0 16px}
+#drop{border:2px dashed #555;border-radius:14px;padding:48px 16px;text-align:center;color:#aaa;cursor:pointer}
+#drop.over{border-color:#4b6bff;color:#fff}input[type=text]{width:100%;box-sizing:border-box;padding:10px;border-radius:8px;
+border:1px solid #444;background:#000;color:#fff;margin:12px 0}pre{background:#1d1d1f;padding:12px;border-radius:8px;white-space:pre-wrap}</style>
+</head><body><h2>Creative Studio — อัปโหลดภาพ</h2>
+<input type="text" id="label" placeholder="ชื่อเรียก (ไม่บังคับ) เช่น nori">
+<div id="drop">ลากไฟล์ภาพมาวางที่นี่ หรือคลิกเพื่อเลือก<input type="file" id="f" multiple accept="image/*" hidden></div>
+<pre id="out"></pre>
+<script>
+const drop=document.getElementById('drop'),f=document.getElementById('f'),out=document.getElementById('out');
+drop.onclick=()=>f.click();
+drop.ondragover=e=>{e.preventDefault();drop.classList.add('over')};
+drop.ondragleave=()=>drop.classList.remove('over');
+drop.ondrop=e=>{e.preventDefault();drop.classList.remove('over');send(e.dataTransfer.files)};
+f.onchange=()=>send(f.files);
+async function send(files){const fd=new FormData();for(const x of files)fd.append('file',x);
+fd.append('label',document.getElementById('label').value);out.textContent='กำลังอัปโหลด...';
+const r=await fetch(location.href,{method:'POST',body:fd});const j=await r.json();
+out.textContent=j.status==='done'?j.assets.map(a=>a.image_id+'   ('+a.original+')').join('\\n'):JSON.stringify(j);}
+</script></body></html>"""
+
+
+@mcp.custom_route("/upload/{ticket}", methods=["GET", "POST"])
+async def upload_route(request: Request):
+    ticket = request.path_params["ticket"]
+    if not _ticket_ok(ticket):
+        return JSONResponse({"status": "error", "error": "upload link expired or invalid; call get_upload_url again"},
+                            status_code=403)
+    if request.method == "GET":
+        return HTMLResponse(UPLOAD_PAGE)
+    form = await request.form()
+    label = str(form.get("label") or "").strip() or None
+    assets = []
+    for item in form.getlist("file"):
+        if not hasattr(item, "read"):
+            continue
+        data = await item.read()
+        if not data or len(data) > MAX_UPLOAD_BYTES:
+            return JSONResponse({"status": "error", "error": f"{item.filename}: empty or larger than 25 MB"},
+                                status_code=400)
+        name = await upload_image_bytes(data, _ext_of(data), label or Path(item.filename or "").stem)
+        rec = {"image_id": f"{ASSET_PREFIX}{name}", "original": item.filename, "bytes": len(data)}
+        size = image_size(data)
+        if size:
+            rec["width"], rec["height"] = size
+        assets.append(rec)
+    if not assets:
+        return JSONResponse({"status": "error", "error": "no file field in the request"}, status_code=400)
+    return JSONResponse({"status": "done", "assets": assets})
 
 
 @mcp.custom_route("/login", methods=["GET", "POST"])
