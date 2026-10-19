@@ -368,7 +368,16 @@ INSTRUCTIONS = (
         "For a character saying exact lines with lip-sync: make the line with text_to_speech, then pass its URL as speech_audio to image_to_video or reference_to_video (duration = speech length + ~1 s, quote the line in the prompt). reference_audios only sets the voice timbre. "
         "Results come back as download URLs. Typical times on draft quality with turbo: "
         "image ~5 s, 3-5 s video ~30-60 s; high quality / long clips take several minutes. "
-        "Write prompts in English for best results; spoken dialogue may be in other languages."
+        "Write prompts in English for best results; spoken dialogue may be in other languages. "
+        "PROMPT RECIPE (gives much better clips): 1) camera move (e.g. 'slow crane shot gliding over "
+        "the roof then tilting down', 'eye-level sideways tracking shot'); 2) light/time of day; "
+        "3) 3-5 concrete actions that happen in the shot; 4) style lock: 'keep the exact art style, "
+        "colors and layout of the first frame' (image_to_video) or 'keep both characters' designs "
+        "exactly as in the references' (reference_to_video); 5) 'Sound:' list of specific sounds, "
+        "crowd 'with no clear words', and 'No music'. Do not ask the model to speak Thai lines "
+        "itself; use text_to_speech + speech_audio for dialogue. For final shots use quality='high' "
+        "(1280x736); for a scene that already exists as an image, prefer image_to_video with that "
+        "image as the first frame over reference_to_video."
 )
 # OAuth (for ChatGPT & co.) + the static owner token as a bearer token (for API/test use).
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
@@ -475,7 +484,7 @@ async def reference_to_video(
     aspect_ratio: Aspect = "16:9",
     quality: Quality = "standard",
     seed: Optional[int] = None,
-    turbo: bool = True,
+    turbo: bool = False,
     wait_seconds: int = 0,
     reference_audios: Optional[list[str]] = None,
     speech_audio: Optional[str] = None,
@@ -500,6 +509,11 @@ async def reference_to_video(
       In the prompt say who is speaking and quote the line, e.g.
       'The woman in the red apron looks at the camera and says: "..."'.
     speech_start_seconds: when the speech starts in the clip (default 0).
+    turbo: default False (full 20 steps). The reference turbo LoRA is only 4 steps and gives
+      blurry, off-model results; use turbo=True only for quick drafts.
+    Put the location/background image in reference_images too and name it in the prompt,
+      and describe each character's key look next to its tag (hair, clothes, props) so the
+      model keeps them on-model.
     prompt: the scene. Refer to references with tags in order: <Picture 1>, <Picture 2> ...
       for images and <Audio 1> ... for audios, e.g.
       '<Picture 1> looks at the camera and says in Thai: "สวัสดีครับ" in the voice of <Audio 1>.'
