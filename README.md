@@ -10,6 +10,7 @@
 | `text_to_image` | ข้อความ → ภาพนิ่ง (Z-Image-Turbo) | GPU เครื่องเช่า |
 | `text_to_speech`, `list_voices`, `design_voice` | เสียงพูด (MiniMax Speech): ความเร็ว ระดับเสียง ความดัง อารมณ์, Voice Modifier (ทุ้ม/ใส, หนัก/นุ่ม, นาสิก/ชัด), เอฟเฟกต์ (เสียงก้อง, โทรศัพท์, หุ่นยนต์), ผสม 2–4 เสียง | MiniMax API |
 | `get_job`, `list_recent_outputs`, `server_status` | เช็กงาน/ผลลัพธ์/สถานะเครื่อง | — |
+| `prompt_guide` | คู่มือรูปแบบ prompt ทางการของ H3 (แท็กบทพูด `<d>[Thai] ...</d>`) | — |
 
 ## ไฟล์ใน repo นี้
 

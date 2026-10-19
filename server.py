@@ -365,19 +365,16 @@ INSTRUCTIONS = (
         "(curl/python) or give the link to the user; reuse the returned image_ids in every shot. Use quality='draft' with 3-5 s "
         "clips for previews, standard/high only for final shots, and batch jobs that use the same "
         "tool together (switching between video tools and text_to_image reloads models, ~15 s). "
-        "For a character saying exact lines with lip-sync: make the line with text_to_speech, then pass its URL as speech_audio to image_to_video or reference_to_video (duration = speech length + ~1 s, quote the line in the prompt). reference_audios only sets the voice timbre. "
+        "For a character saying exact lines with lip-sync: make the line with text_to_speech, then pass its URL as speech_audio to image_to_video or reference_to_video (duration = speech length + ~1 s, put the same line in a <d>[Thai] ...</d> tag in the prompt). reference_audios only sets the voice timbre. "
         "Results come back as download URLs. Typical times on draft quality with turbo: "
         "image ~5 s, 3-5 s video ~30-60 s; high quality / long clips take several minutes. "
         "Write prompts in English for best results; spoken dialogue may be in other languages. "
-        "PROMPT RECIPE (gives much better clips): 1) camera move (e.g. 'slow crane shot gliding over "
-        "the roof then tilting down', 'eye-level sideways tracking shot'); 2) light/time of day; "
-        "3) 3-5 concrete actions that happen in the shot; 4) style lock: 'keep the exact art style, "
-        "colors and layout of the first frame' (image_to_video) or 'keep both characters' designs "
-        "exactly as in the references' (reference_to_video); 5) 'Sound:' list of specific sounds, "
-        "crowd 'with no clear words', and 'No music'. Do not ask the model to speak Thai lines "
-        "itself; use text_to_speech + speech_audio for dialogue. For final shots use quality='high' "
-        "(1280x736); for a scene that already exists as an image, prefer image_to_video with that "
-        "image as the first frame over reference_to_video."
+        "BEFORE WRITING ANY VIDEO PROMPT call prompt_guide() once: H3 expects its official structured "
+        "prompt format (integrated_multimodal_description / overall_soundscape / non_diegetic_music, "
+        "speaker IDs (S1), dialogue as <d>[Thai] exact words</d>). Plain quoted dialogue gives worse "
+        "speech and can render as burned-in subtitles. Final shots: quality='high'; shots with spoken "
+        "lines: turbo=False (speech is the first thing low step counts ruin). For a scene that already "
+        "exists as an image, prefer image_to_video with that image as the first frame."
 )
 # OAuth (for ChatGPT & co.) + the static owner token as a bearer token (for API/test use).
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
@@ -449,8 +446,9 @@ async def image_to_video(
       text_to_speech). It is placed into the clip's soundtrack so the character's mouth
       moves to THESE exact words (lip-sync). Set duration_seconds to the speech length
       (text_to_speech returns duration_seconds) plus ~0.5-1 s; audio past the end is cut.
-      In the prompt say who is speaking and quote the line, e.g.
-      'The woman in the red apron looks at the camera and says: "..."'.
+      In the prompt say who is speaking and put the same line in a dialogue tag, e.g.
+      'The woman in the red apron (S1) looks at the camera and says <d>[Thai] ...</d>'
+      (see prompt_guide).
     speech_start_seconds: when the speech starts in the clip (default 0).
     Returns job_id; poll get_job until status == "done"."""
     try:
@@ -506,8 +504,9 @@ async def reference_to_video(
       text_to_speech). It is placed into the clip's soundtrack so the character's mouth
       moves to THESE exact words (lip-sync). Set duration_seconds to the speech length
       (text_to_speech returns duration_seconds) plus ~0.5-1 s; audio past the end is cut.
-      In the prompt say who is speaking and quote the line, e.g.
-      'The woman in the red apron looks at the camera and says: "..."'.
+      In the prompt say who is speaking and put the same line in a dialogue tag, e.g.
+      'The woman in the red apron (S1) looks at the camera and says <d>[Thai] ...</d>'
+      (see prompt_guide).
     speech_start_seconds: when the speech starts in the clip (default 0).
     turbo: default False (full 20 steps). The reference turbo LoRA is only 4 steps and gives
       blurry, off-model results; use turbo=True only for quick drafts.
@@ -516,7 +515,9 @@ async def reference_to_video(
       model keeps them on-model.
     prompt: the scene. Refer to references with tags in order: <Picture 1>, <Picture 2> ...
       for images and <Audio 1> ... for audios, e.g.
-      '<Picture 1> looks at the camera and says in Thai: "สวัสดีครับ" in the voice of <Audio 1>.'
+      '<Picture 1> (S1) looks at the camera and says in the voice timbre of <Audio 1>
+      <d>[Thai] สวัสดีครับ</d>'. The audio sample must say a DIFFERENT sentence; add
+      'Reference the timbre only; do not reuse its words.' (see prompt_guide).
     Returns job_id; poll get_job until status == "done"."""
     if not 1 <= len(reference_images) <= 9:
         return {"status": "error", "error": "provide between 1 and 9 reference images"}
@@ -805,6 +806,79 @@ async def list_recent_outputs(limit: int = 10) -> dict:
         for o in st.get("outputs", []):
             items.append({"job_id": job_id, **o})
     return {"outputs": items[:limit]}
+
+
+PROMPT_GUIDE = """MiniMax H3 prompt guide (official structured format; the hosted MiniMax
+service rewrites prompts into this automatically, this server does not, so write it yourself).
+Write everything in English except the exact spoken words.
+
+== Base format (text_to_video, image_to_video) ==
+Three fields separated by blank lines:
+
+integrated_multimodal_description: [Shot 1] <style label>. <subjects + setting, 1-2 identity
+details each>. <main action>. The camera <move> with <amplitude> at <speed>. <Character>
+(S1), <age range, gender, pitch, timbre, speaking rate, native Central Thai accent>, <delivery:
+e.g. shouts desperately, voice breaking> says <d>[Thai] exact words</d> <other non-speaking
+characters: 'does not speak'>.
+
+overall_soundscape: <1-4 sentences: ambience, physical sounds, non-verbal human sounds like
+sobbing or screaming. No dialogue here. 'N/A' only for total silence.>
+
+non_diegetic_music: <score the characters cannot hear> or N/A
+
+image_to_video: put this line FIRST, then one blank line, then the three fields:
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+== Dialogue rules ==
+- Inside <d>...</d>: only the language tag and the exact words, verbatim, never translated:
+  <d>[Thai] รีบ หนี ไป ลูก!</d>. Identity, emotion, accent, action go OUTSIDE the tag.
+- Never put dialogue in plain "quotes" (quotes are for on-screen text and can become subtitles).
+- Give every speaker a stable ID (S1), (S2)... with voice attributes at first appearance.
+  Characters who never speak get no ID; say they do not speak.
+- One sentence or one speaker turn per clip. Thai is NOT one of H3's 11 fully supported
+  languages, so keep lines short (about 3 Thai syllables per second max), put spaces between
+  words, write numbers as words, avoid rare words and English loanwords.
+- Match duration_seconds to the line + action; extra time makes the model invent filler speech.
+- Voiceover: 'says in an off-screen voiceover <d>[Thai] ...</d>', then state the on-screen
+  character's lips stay closed.
+- Dialogue cut off by the end of the clip: end the tag with <cutoff>.
+- Speaking shots: turbo=False for finals. Draft 2-3 seeds and let the user pick, then render
+  high with that seed. Stop after 3 failed tries; use text_to_speech + speech_audio instead.
+
+== Reference mode (reference_to_video) ==
+Same rules. Start the prompt with a short subject_definitions block, e.g.
+subject_definitions: <Picture 1> is Nori, a girl explorer (dark hair, teal jacket, light-green
+scarf, boxy detector on her right hip). <Picture 2> is the market walkway setting.
+<Audio 1> is the voice timbre reference for Nori. Reference the timbre only; do not reuse its words.
+Then the three fields, referring to subjects by tag: '<Picture 1> (S1) says in the voice timbre
+of <Audio 1> <d>[Thai] ...</d>'. The audio sample must say a different sentence than the line.
+
+== Visual quality recipe ==
+Camera move, light/time of day, 3-5 concrete actions, style lock ('keep the exact art style,
+colors and layout of the first frame' or 'keep the characters' designs exactly as in the
+references'), list props each character carries in EVERY shot (continuity).
+
+== Example (image_to_video) ==
+For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
+
+integrated_multimodal_description: [Shot 1] Nostalgic anime film style, keep the exact art
+style of the first frame. Inside the ancient hall, blinding light bursts from the floor and
+stones float upward. A man in his late thirties holding a lantern (S1), deep warm male voice,
+native Central Thai accent, turns toward the little girl hiding behind the rocks and shouts
+desperately, voice breaking <d>[Thai] โนริ! ลูก พ่อ! รีบ หนี ไป!</d> The little girl does not speak.
+
+overall_soundscape: Roaring magical wind, cracking stone, a deep rising hum from the glowing ring gate.
+
+non_diegetic_music: N/A
+"""
+
+
+@mcp.tool()
+async def prompt_guide() -> dict:
+    """Read this BEFORE writing prompts for text_to_video / image_to_video / reference_to_video:
+    the official MiniMax H3 structured prompt format, dialogue tags <d>[Thai] ...</d>, speaker
+    IDs, Thai-specific tips and examples. Returns the guide text."""
+    return {"guide": PROMPT_GUIDE}
 
 
 @mcp.tool()
