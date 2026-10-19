@@ -8,7 +8,7 @@
 | `image_to_video` | ภาพ (เฟรมแรก/เฟรมสุดท้าย) → วิดีโอพร้อมเสียง (+ `speech_audio` = ใส่เสียงพูดจาก MiniMax ให้ปากขยับตาม) | GPU เครื่องเช่า |
 | `reference_to_video` | ภาพอ้างอิง 1–9 ภาพ (+ เสียงต้นแบบ 1–3 ไฟล์, `speech_audio` ปากขยับตามเสียง) → วิดีโอที่มีตัวละคร/ของในภาพ | GPU เครื่องเช่า |
 | `text_to_image` | ข้อความ → ภาพนิ่ง (Z-Image-Turbo) | GPU เครื่องเช่า |
-| `text_to_speech`, `list_voices`, `design_voice` | เสียงพูด (MiniMax Speech) | MiniMax API |
+| `text_to_speech`, `list_voices`, `design_voice` | เสียงพูด (MiniMax Speech): ความเร็ว ระดับเสียง ความดัง อารมณ์, Voice Modifier (ทุ้ม/ใส, หนัก/นุ่ม, นาสิก/ชัด), เอฟเฟกต์ (เสียงก้อง, โทรศัพท์, หุ่นยนต์), ผสม 2–4 เสียง | MiniMax API |
 | `get_job`, `list_recent_outputs`, `server_status` | เช็กงาน/ผลลัพธ์/สถานะเครื่อง | — |
 
 ## ไฟล์ใน repo นี้
@@ -18,6 +18,7 @@
 - `start.sh` — เปิด MCP + Cloudflare tunnel (ได้ลิงก์ใหม่ทุกครั้ง)
 - `restart_server.sh` — รีสตาร์ทเฉพาะ MCP (ลิงก์เดิม)
 - `test_client.py` — ทดสอบ (`--full` = ทดสอบครบทุกเครื่องมือ)
+- `tts_try.py` — ลองเสียงจาก terminal: `venv/bin/python tts_try.py '{"text":"สวัสดีค่ะ","voice_id":"Thai_female_1_sample1","pitch":3}'`
 
 > ในไฟล์ไม่มีรหัสลับ API key ใส่ใน Template ของ Vast (ตั้งเป็น private) เท่านั้น
 

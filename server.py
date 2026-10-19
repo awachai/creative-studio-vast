@@ -563,6 +563,12 @@ async def text_to_speech(
     emotion: Optional[Literal["happy", "sad", "angry", "fearful", "disgusted",
                               "surprised", "calm", "fluent"]] = None,
     audio_format: Literal["mp3", "wav", "flac"] = "mp3",
+    volume: float = 1.0,
+    deepen_lighten: int = 0,
+    stronger_softer: int = 0,
+    nasal_crisp: int = 0,
+    sound_effect: Optional[Literal["spacious_echo", "auditorium_echo", "lofi_telephone", "robotic"]] = None,
+    voice_mix: Optional[list[dict]] = None,
 ) -> dict:
     """Convert text to natural speech with MiniMax Speech (cloud API, billed per character).
 
@@ -570,6 +576,15 @@ async def text_to_speech(
       understand tags like (laughs), (sighs).
     voice_id: from list_voices; defaults to the server's configured voice.
     language: language boost, e.g. "Thai", "English", "Japanese", or "auto".
+    speed 0.5-2, pitch -12..12 (semitones), volume 0.1-10.
+    Voice modifier (same as the MiniMax web "Voice Modifier"), each -100..100, 0 = unchanged:
+      deepen_lighten: negative = deeper, positive = lighter/brighter.
+      stronger_softer: negative = stronger/more forceful, positive = softer.
+      nasal_crisp: negative = more nasal, positive = crisper.
+    sound_effect: spacious_echo, auditorium_echo, lofi_telephone (phone call), robotic.
+    voice_mix: blend 2-4 voices into a new one instead of voice_id, e.g.
+      [{"voice_id": "Thai_female_1_sample1", "weight": 70}, {"voice_id": "English_PlayfulGirl", "weight": 30}]
+      (weights 1-100). Keep a character's exact settings to reuse the same voice.
     Returns a download URL for the audio file (synchronous)."""
     if not MINIMAX_API_KEY:
         return {"status": "error", "error": "MINIMAX_API_KEY is not configured on the server"}
@@ -578,9 +593,16 @@ async def text_to_speech(
         return {"status": "error", "error": "text is empty"}
     if len(text) > 10000:
         return {"status": "error", "error": "text exceeds 10,000 characters"}
-    voice_setting = {"voice_id": voice_id or MINIMAX_VOICE_ID,
-                     "speed": max(0.5, min(2.0, float(speed))), "vol": 1,
-                     "pitch": max(-12, min(12, int(pitch)))}
+    clamp = lambda v, lo, hi: max(lo, min(hi, v))
+    mix = []
+    for m in voice_mix or []:
+        if isinstance(m, dict) and m.get("voice_id"):
+            mix.append({"voice_id": str(m["voice_id"]), "weight": clamp(int(m.get("weight", 50)), 1, 100)})
+    if voice_mix and not 2 <= len(mix) <= 4:
+        return {"status": "error", "error": "voice_mix needs 2-4 entries like {voice_id, weight}"}
+    voice_setting = {"voice_id": "" if mix else (voice_id or MINIMAX_VOICE_ID),
+                     "speed": clamp(float(speed), 0.5, 2.0), "vol": clamp(float(volume), 0.1, 10.0),
+                     "pitch": clamp(int(pitch), -12, 12)}
     if emotion:
         voice_setting["emotion"] = emotion
     body = {
@@ -589,6 +611,14 @@ async def text_to_speech(
         "audio_setting": {"sample_rate": 32000, "bitrate": 128000, "format": audio_format, "channel": 1},
         "output_format": "hex",
     }
+    if mix:
+        body["timbre_weights"] = mix
+    modify = {k: clamp(int(v), -100, 100) for k, v in
+              (("pitch", deepen_lighten), ("intensity", stronger_softer), ("timbre", nasal_crisp)) if v}
+    if sound_effect:
+        modify["sound_effects"] = sound_effect
+    if modify:
+        body["voice_modify"] = modify
     if language:
         body["language_boost"] = language
     async with httpx.AsyncClient(timeout=180) as c:
@@ -610,7 +640,9 @@ async def text_to_speech(
     return {"status": "done", "tool": "text_to_speech",
             "outputs": [{"type": "audio", "filename": fn, "url": download_url(sub, fn),
                          "duration_seconds": round((extra.get("audio_length") or 0) / 1000, 2)}],
-            "characters_billed": extra.get("usage_characters"), "voice_id": voice_setting["voice_id"]}
+            "characters_billed": extra.get("usage_characters"),
+            "voice_id": voice_setting["voice_id"] or None, **({"voice_mix": mix} if mix else {}),
+            **({"voice_modify": modify} if modify else {})}
 
 
 @mcp.tool()

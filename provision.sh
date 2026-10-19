@@ -68,7 +68,7 @@ for p in "${pids[@]}"; do wait "$p" || FAIL=1; done
 # 2) MCP server code
 # ---------------------------------------------------------------------------
 if [ -n "$STUDIO_CODE_URL" ]; then
-  for f in server.py oauth.py workflows.py start.sh restart_server.sh test_client.py provision.sh; do
+  for f in server.py oauth.py workflows.py start.sh restart_server.sh test_client.py tts_try.py provision.sh; do
     if curl -fsSL "$STUDIO_CODE_URL/$f" -o "$D/$f.new"; then mv "$D/$f.new" "$D/$f"; else
       echo "[code] could not download $f"; rm -f "$D/$f.new"; fi
   done
