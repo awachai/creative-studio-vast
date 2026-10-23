@@ -9,6 +9,9 @@
 | `reference_to_video` | ภาพอ้างอิง 1–9 ภาพ (+ เสียงต้นแบบ 1–3 ไฟล์, `speech_audio` ปากขยับตามเสียง) → วิดีโอที่มีตัวละคร/ของในภาพ | GPU เครื่องเช่า |
 | `text_to_image` | ข้อความ → ภาพนิ่ง (Z-Image-Turbo) | GPU เครื่องเช่า |
 | `text_to_speech`, `list_voices`, `design_voice` | เสียงพูด (MiniMax Speech): ความเร็ว ระดับเสียง ความดัง อารมณ์, Voice Modifier (ทุ้ม/ใส, หนัก/นุ่ม, นาสิก/ชัด), เอฟเฟกต์ (เสียงก้อง, โทรศัพท์, หุ่นยนต์), ผสม 2–4 เสียง | MiniMax API |
+| `upscale_to_2k` | คลิป 768P ที่ทำบนเครื่องเช่า (quality standard/high, 4–15 วิ) → 2K โดยภาพเดิม (~$0.05/วิ) | MiniMax API (เสียเงิน) |
+| `api_video` | สร้างวิดีโอ H3 บนคลาวด์ของ MiniMax (H3 768P/2K, H3-Max 480P/768P) — ไม่มี seed ไม่มีล็อกปากตามไฟล์เสียง | MiniMax API (เสียเงิน) |
+| `extract_frame` | ดึงเฟรม (แรก/สุดท้าย/วินาทีที่กำหนด) ของคลิปเป็น image_id เช่น เฟรมสุดท้ายของช็อตก่อน → เฟรมแรกของช็อตต่อไป | เครื่องเช่า |
 | `get_job`, `list_recent_outputs`, `server_status` | เช็กงาน/ผลลัพธ์/สถานะเครื่อง | — |
 | `prompt_guide` | คู่มือรูปแบบ prompt ทางการของ H3 (แท็กบทพูด `<d>[Thai] ...</d>`) | — |
 
@@ -20,6 +23,10 @@
 - `restart_server.sh` — รีสตาร์ทเฉพาะ MCP (ลิงก์เดิม)
 - `test_client.py` — ทดสอบ (`--full` = ทดสอบครบทุกเครื่องมือ)
 - `tts_try.py` — ลองเสียงจาก terminal: `venv/bin/python tts_try.py '{"text":"สวัสดีค่ะ","voice_id":"Thai_female_1_sample1","pitch":3}'`
+
+- `minimax_direct.py` — ตัวเชื่อม MiniMax API ตรง (สร้างวิดีโอ, อัปเกรด 2K, เช็กงาน) + ตัวช่วย ffmpeg
+
+**เครื่องมือที่เสียเงิน (`api_video`, `upscale_to_2k`)** เรียกครั้งแรกจะได้ราคาประเมิน + `confirm_code` ยังไม่ส่งงาน ต้องเรียกซ้ำพร้อม `confirm_code` จึงจะส่งจริง ใช้คีย์ `MINIMAX_API_KEY` ตัวเดียวกับเสียงพูด (บัญชีต้องเป็นแบบ pay-as-you-go และมียอดเงิน) `server_status` แสดงยอดใช้จ่ายโดยประมาณของเครื่องนี้
 
 > ในไฟล์ไม่มีรหัสลับ API key ใส่ใน Template ของ Vast (ตั้งเป็น private) เท่านั้น
 

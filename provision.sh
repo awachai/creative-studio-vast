@@ -68,7 +68,7 @@ for p in "${pids[@]}"; do wait "$p" || FAIL=1; done
 # 2) MCP server code
 # ---------------------------------------------------------------------------
 if [ -n "$STUDIO_CODE_URL" ]; then
-  for f in server.py oauth.py workflows.py start.sh restart_server.sh test_client.py tts_try.py mcp_call.py provision.sh; do
+  for f in server.py oauth.py workflows.py minimax_direct.py start.sh restart_server.sh test_client.py tts_try.py mcp_call.py provision.sh; do
     if curl -fsSL "$STUDIO_CODE_URL/$f" -o "$D/$f.new"; then mv "$D/$f.new" "$D/$f"; else
       echo "[code] could not download $f"; rm -f "$D/$f.new"; fi
   done
@@ -96,8 +96,10 @@ fi
 # ---------------------------------------------------------------------------
 if [ ! -x "$D/venv/bin/python" ]; then
   python3 -m venv "$D/venv" && "$D/venv/bin/pip" install -q --upgrade pip &&
-  "$D/venv/bin/pip" install -q "mcp>=1.12,<2" httpx pillow uvicorn
+  "$D/venv/bin/pip" install -q "mcp>=1.12,<2" httpx pillow uvicorn imageio-ffmpeg
 fi
+# ffmpeg for extract_frame / upscale_to_2k (also added to venvs made by older versions)
+"$D/venv/bin/python" -c "import imageio_ffmpeg" 2>/dev/null || "$D/venv/bin/pip" install -q imageio-ffmpeg
 
 # ---------------------------------------------------------------------------
 # 5) Start (waits for ComfyUI to be up)

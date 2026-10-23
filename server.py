@@ -7,6 +7,8 @@ Runs next to ComfyUI on the GPU machine and exposes, over streamable HTTP
   text_to_video, image_to_video, reference_to_video   -> MiniMax H3 (local GPU)
   text_to_image                                       -> Z-Image-Turbo (local GPU)
   text_to_speech, list_voices                         -> MiniMax Speech API (cloud)
+  api_video, upscale_to_2k                            -> MiniMax H3 direct API (cloud, paid)
+  extract_frame                                       -> one frame of a clip as an image_id
   get_job, list_recent_outputs, server_status
 
 Env vars:
@@ -15,7 +17,8 @@ Env vars:
   COMFY_OUTPUT_DIR   ComfyUI output folder (default /workspace/ComfyUI/output)
   PUBLIC_URL         public base URL of this server, used for download links
   MCP_PORT           listen port on 127.0.0.1 (default 8765)
-  MINIMAX_API_KEY    optional, enables text_to_speech / list_voices
+  MINIMAX_API_KEY    optional, enables text_to_speech / list_voices / api_video / upscale_to_2k
+                     (the video tools need a pay-as-you-go MiniMax account with balance)
   MINIMAX_API_BASE   default https://api.minimax.io  (China keys: https://api.minimaxi.com)
   MINIMAX_VOICE_ID   default voice for text_to_speech
 """
@@ -27,6 +30,7 @@ import binascii
 import hashlib
 import hmac
 import io
+import json
 import os
 import random
 import re
@@ -42,6 +46,7 @@ from mcp.server.fastmcp import FastMCP
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, StreamingResponse
 
+import minimax_direct as MD
 import workflows as W
 from oauth import SCOPE, OwnerOAuthProvider
 
@@ -59,6 +64,10 @@ MCP_PORT = int(os.environ.get("MCP_PORT", "8765"))
 MINIMAX_API_KEY = os.environ.get("MINIMAX_API_KEY", "")
 MINIMAX_API_BASE = os.environ.get("MINIMAX_API_BASE", "https://api.minimax.io").rstrip("/")
 MINIMAX_VOICE_ID = os.environ.get("MINIMAX_VOICE_ID", "English_expressive_narrator")
+JOBS_DIR = Path(os.environ.get("STUDIO_JOBS_DIR", str(Path(__file__).with_name("jobs"))))
+API_PREFIX = "api:"   # job_ids of MiniMax cloud tasks, e.g. "api:424010985738629"
+API_SUB = "api"       # output subfolder for downloaded cloud results
+video_api = MD.VideoAPI(MINIMAX_API_KEY, MINIMAX_API_BASE) if MINIMAX_API_KEY else None
 
 if not MCP_TOKEN:
     raise SystemExit("MCP_TOKEN is not set")
@@ -298,7 +307,51 @@ def _collect_outputs(entry: dict) -> list[dict]:
     return files
 
 
+# ---------------------------------------------------------------------------
+# Job records (jobs/<id>.json): the workflow/request behind each clip, so a clip can be
+# upscaled to 2K later even after ComfyUI forgets its history.
+# ---------------------------------------------------------------------------
+def _job_file(job_id: str) -> Path:
+    return JOBS_DIR / f"{re.sub(r'[^A-Za-z0-9_.-]', '_', job_id)}.json"
+
+
+def load_job(job_id: str) -> dict:
+    try:
+        return json.loads(_job_file(job_id).read_text())
+    except Exception:
+        return {}
+
+
+def save_job(job_id: str, rec: dict) -> None:
+    try:
+        JOBS_DIR.mkdir(parents=True, exist_ok=True)
+        p = _job_file(job_id)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rec, ensure_ascii=False))
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
+def _output_items(entry: dict) -> list[list[str]]:
+    items = []
+    for out in entry.get("outputs", {}).values():
+        for item in out.get("images", []) + out.get("videos", []) + out.get("gifs", []) + out.get("audio", []):
+            if item.get("type", "output") == "output" and item.get("filename"):
+                items.append([item.get("subfolder", ""), item["filename"]])
+    return items
+
+
+def _remember_outputs(job_id: str, entry: dict) -> None:
+    rec = load_job(job_id)
+    if rec and not rec.get("outputs"):
+        rec["outputs"] = _output_items(entry)
+        save_job(job_id, rec)
+
+
 async def job_status(job_id: str) -> dict:
+    if job_id.startswith(API_PREFIX):
+        return await api_job_status(job_id)
     hist = await comfy_get(f"/history/{job_id}")
     if job_id in hist:
         entry = hist[job_id]
@@ -310,6 +363,7 @@ async def job_status(job_id: str) -> dict:
                     "node": err.get("node_type")}
         files = _collect_outputs(entry)
         if st.get("completed") or files:
+            _remember_outputs(job_id, entry)
             return {"job_id": job_id, "status": "done", "outputs": files}
     q = await comfy_get("/queue")
     if any(item[1] == job_id for item in q.get("queue_running", [])):
@@ -325,6 +379,8 @@ async def run_job(workflow: dict, info: dict, wait_seconds: int) -> dict:
         job_id = await submit(workflow)
     except Exception as e:
         return {"status": "error", "error": str(e)}
+    save_job(job_id, {"job_id": job_id, "tool": info.get("tool"), "created": time.time(),
+                      "workflow": workflow})
     result = {"job_id": job_id, "status": "queued", **info}
     wait = max(0, min(MAX_WAIT, int(wait_seconds or 0)))
     if wait:
@@ -374,7 +430,15 @@ INSTRUCTIONS = (
         "speaker IDs (S1), dialogue as <d>[Thai] exact words</d>). Plain quoted dialogue gives worse "
         "speech and can render as burned-in subtitles. Final shots: quality='high'; shots with spoken "
         "lines: turbo=False (speech is the first thing low step counts ruin). For a scene that already "
-        "exists as an image, prefer image_to_video with that image as the first frame."
+        "exists as an image, prefer image_to_video with that image as the first frame. "
+        "HYBRID WORKFLOW: drafts and 768P finals run on this GPU (no per-clip cost; same seed + same "
+        "quality/aspect/duration reproduces a draft's composition). When the user wants 2K, call "
+        "upscale_to_2k(job_id of the chosen local clip, quality standard/high, 4-15 s): MiniMax's "
+        "cloud turns that exact clip into 2K for ~$0.05/s. api_video renders on MiniMax's cloud "
+        "instead (no seed, no lip-sync to a speech track; use it only when the user asks). Both cloud "
+        "tools COST MONEY: the first call returns the estimated cost and a confirm_code; tell the user "
+        "the cost and call again with confirm_code only after they agree. extract_frame turns any "
+        "frame of a clip into an image_id (last frame of one shot -> first frame of the next)."
 )
 # OAuth (for ChatGPT & co.) + the static owner token as a bearer token (for API/test use).
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions, RevocationOptions
@@ -783,16 +847,17 @@ async def list_assets(search: Optional[str] = None, limit: int = 50) -> dict:
 
 @mcp.tool()
 async def get_job(job_id: str, wait_seconds: int = 45) -> dict:
-    """Check a GPU job from text_to_video / image_to_video / reference_to_video /
-    text_to_image. Waits up to wait_seconds (default 45, max 45; larger values are capped) and returns as soon as the
+    """Check a job from text_to_video / image_to_video / reference_to_video /
+    text_to_image, or a cloud job ("api:...") from api_video / upscale_to_2k. Waits up to wait_seconds (default 45, max 45; larger values are capped) and returns as soon as the
     job finishes, so call it again only if status is still queued/running.
     status: queued, running, done, error. When done, 'outputs' holds URLs."""
     deadline = time.monotonic() + max(0, min(MAX_WAIT, int(wait_seconds or 0)))
+    job_id = (job_id or "").strip()
     while True:
         st = await job_status(job_id)
         if st["status"] in ("done", "error", "unknown") or time.monotonic() >= deadline:
             return st
-        await asyncio.sleep(2)
+        await asyncio.sleep(5 if job_id.startswith(API_PREFIX) else 2)
 
 
 @mcp.tool()
@@ -806,6 +871,521 @@ async def list_recent_outputs(limit: int = 10) -> dict:
         for o in st.get("outputs", []):
             items.append({"job_id": job_id, **o})
     return {"outputs": items[:limit]}
+
+
+# ---------------------------------------------------------------------------
+# MiniMax direct API (cloud H3): api_video, upscale_to_2k, extract_frame
+# ---------------------------------------------------------------------------
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+MAX_VIDEO_BYTES = 50 * 1024 * 1024
+_api_downloads: dict[str, asyncio.Task] = {}
+
+
+def _output_path(sub: str, fn: str) -> Path:
+    sub = "" if sub in ("", "_") else Path(sub).name
+    return COMFY_OUTPUT_DIR / sub / Path(fn).name
+
+
+def _parse_server_url(s: str) -> Optional[tuple[str, str]]:
+    """(subfolder, filename) of a /files/ link made by this server, else None."""
+    if PUBLIC_URL and s.startswith(f"{PUBLIC_URL}/files/"):
+        s = s[len(PUBLIC_URL):]
+    m = re.match(r"^/files/([^/]+)/([^?]+)", s)
+    if not m:
+        return None
+    sub = unquote(m.group(1))
+    return ("" if sub == "_" else sub), Path(unquote(m.group(2))).name
+
+
+def _video_ext(data: bytes) -> Optional[str]:
+    if data[4:8] == b"ftyp":
+        return "mov" if data[8:10] == b"qt" else "mp4"
+    return None
+
+
+def _confirm_code(kind: str, args: dict) -> str:
+    raw = json.dumps({"kind": kind, **args}, sort_keys=True, ensure_ascii=False)
+    return hmac.new(MCP_TOKEN.encode(), raw.encode(), hashlib.sha256).hexdigest()[:10]
+
+
+def _needs_confirmation(code: str, summary: dict) -> dict:
+    return {"status": "needs_confirmation", "confirm_code": code, **summary,
+            "note": "Nothing was sent or billed. Show the user the estimated cost and wait for "
+                    "their OK, then call this tool again with the same arguments plus "
+                    f"confirm_code='{code}'."}
+
+
+async def find_video(ref: str) -> dict:
+    """Locate a clip made by this server: a local job_id, an 'api:...' job_id, or a /files/ URL.
+    Returns {path, sub, filename, job_id, workflow, record}."""
+    ref = (ref or "").strip()
+    if ref.startswith(API_PREFIX):
+        rec = load_job(ref)
+        if not rec.get("local_file"):
+            raise ValueError(f"{ref} has no finished video yet (call get_job until it is done)")
+        sub, fn = rec["local_file"]
+        return {"path": _output_path(sub, fn), "sub": sub, "filename": fn, "job_id": ref,
+                "workflow": None, "record": rec}
+    if UUID_RE.match(ref):
+        rec, workflow, items = load_job(ref), None, []
+        try:
+            hist = await comfy_get(f"/history/{ref}")
+            entry = hist.get(ref) or {}
+            items = _output_items(entry)
+            p = entry.get("prompt")
+            if isinstance(p, list) and len(p) > 2 and isinstance(p[2], dict):
+                workflow = p[2]
+        except Exception:
+            pass
+        items = items or rec.get("outputs") or []
+        workflow = workflow or rec.get("workflow")
+        vids = [it for it in items if it[1].lower().endswith((".mp4", ".mov", ".webm"))]
+        if not vids:
+            raise ValueError(f"job {ref} has no finished video (still rendering, or not a video job)")
+        sub, fn = vids[0]
+        return {"path": _output_path(sub, fn), "sub": sub, "filename": fn, "job_id": ref,
+                "workflow": workflow, "record": rec}
+    parsed = _parse_server_url(ref)
+    if parsed:
+        sub, fn = parsed
+        found = {"path": _output_path(sub, fn), "sub": sub, "filename": fn, "job_id": None,
+                 "workflow": None, "record": {}}
+        for p in JOBS_DIR.glob("*.json"):
+            try:
+                rec = json.loads(p.read_text())
+            except Exception:
+                continue
+            if [sub, fn] in (rec.get("outputs") or []) or rec.get("local_file") == [sub, fn]:
+                found.update(job_id=rec.get("job_id"), workflow=rec.get("workflow"), record=rec)
+                break
+        return found
+    raise ValueError("video must be a job_id (local or 'api:...') or a video URL returned by this server")
+
+
+async def _video_path_any(ref: str) -> Path:
+    """Like find_video, but also downloads an outside http(s) video into the input folder."""
+    try:
+        return (await find_video(ref))["path"]
+    except ValueError:
+        if not ref.strip().startswith(("http://", "https://")):
+            raise
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as c:
+        r = await c.get(ref.strip())
+        r.raise_for_status()
+    data = r.content
+    if not data or len(data) > MAX_VIDEO_BYTES:
+        raise ValueError("video is empty or larger than 50 MB")
+    ext = _video_ext(data) or "mp4"
+    path = COMFY_INPUT_DIR / f"video_{uuid.uuid4().hex[:10]}.{ext}"
+    COMFY_INPUT_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+async def _source_bytes(src: str) -> bytes:
+    """Bytes of an asset:..., a /files/ URL of this server, an http(s) URL, a data URI or base64."""
+    s = (src or "").strip()
+    if s.startswith(ASSET_PREFIX):
+        path = COMFY_INPUT_DIR / Path(s[len(ASSET_PREFIX):]).name
+        if not path.is_file():
+            raise ValueError(f"unknown id {s}")
+        return path.read_bytes()
+    parsed = _parse_server_url(s)
+    if parsed and _output_path(*parsed).is_file():
+        return _output_path(*parsed).read_bytes()
+    data, _ = await load_input_image(s)   # URL / data URI / base64 (any file type)
+    return data
+
+
+async def _api_image(src: str) -> str:
+    """Image reference -> URL string for the API (outside URLs pass through, the rest inline)."""
+    s = (src or "").strip()
+    if s.startswith(("http://", "https://")) and not _parse_server_url(s):
+        return s
+    data = await _source_bytes(s)
+    return MD.data_uri(data, _ext_of(data))
+
+
+async def _api_reference_audios(sources: list[str]) -> list[dict]:
+    files = []
+    for s in sources:
+        p = COMFY_INPUT_DIR / await resolve_audio(s)
+        d = (await MD.probe(p)).get("duration") or 0.0
+        if d < MD.REF_AUDIO_MIN:
+            raise ValueError(f"reference audio is {d:.1f} s; each must be at least {MD.REF_AUDIO_MIN:.0f} s")
+        files.append((p, d))
+    over = sum(d for _, d in files) > MD.REF_AUDIO_TOTAL
+    per = MD.REF_AUDIO_TOTAL / max(1, len(files))
+    items = []
+    for p, d in files:
+        if not over and p.suffix.lower() in (".mp3", ".wav"):
+            data, ext = p.read_bytes(), p.suffix[1:]
+        else:
+            out = p.with_name(p.stem + "_api.wav")
+            await MD.to_wav(p, out, per if over else None)
+            data, ext = out.read_bytes(), "wav"
+        items.append(MD.media_item("audio", MD.data_uri(data, ext), "reference_audio"))
+    return items
+
+
+async def _api_video_source(path: Path, public: Optional[tuple[str, str]] = None) -> str:
+    """Inline small clips; larger ones go by this server's signed public URL."""
+    size = path.stat().st_size
+    if size <= MD.INLINE_VIDEO_BYTES:
+        data = path.read_bytes()
+        return MD.data_uri(data, _video_ext(data) or "mp4")
+    if public:
+        return download_url(*public)
+    raise ValueError("video is larger than 20 MB and is not a file of this server")
+
+
+async def _regen_inputs_from_workflow(wf: dict) -> tuple[str, list[dict], list[str]]:
+    """Exact prompt + first/last/reference inputs a local H3 job was rendered with."""
+    h3 = (wf.get("h3") or {}).get("inputs") or {}
+    text = h3.get("prompt")
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("could not read the prompt this clip was rendered with")
+
+    def linked(link, key):
+        node = wf.get(link[0]) if isinstance(link, list) and link else None
+        return ((node or {}).get("inputs") or {}).get(key), node
+
+    items, notes = [], []
+
+    def image_item(link, role):
+        name, _ = linked(link, "image")
+        path = COMFY_INPUT_DIR / Path(str(name)).name
+        if not path.is_file():
+            raise ValueError(f"input image {name} is no longer on this server")
+        data = path.read_bytes()
+        items.append(MD.media_item("image", MD.data_uri(data, _ext_of(data)), role))
+
+    if "first_frame" in h3:
+        image_item(h3["first_frame"], "first_frame")
+    if "last_frame" in h3:
+        image_item(h3["last_frame"], "last_frame")
+    idx = lambda k: int(k.rsplit("_", 1)[1])
+    for k in sorted((k for k in h3 if k.startswith("ref_images.")), key=idx):
+        image_item(h3[k], "reference_image")
+    for k in sorted((k for k in h3 if k.startswith("ref_audios.")), key=idx):
+        seconds, trim = linked(h3[k], "duration")
+        name, _ = linked((trim or {}).get("inputs", {}).get("audio"), "audio")
+        src = COMFY_INPUT_DIR / Path(str(name)).name
+        if not src.is_file():
+            raise ValueError(f"reference audio {name} is no longer on this server")
+        out = src.with_name(src.stem + "_regen.wav")
+        await MD.to_wav(src, out, float(seconds) if seconds else MD.REF_AUDIO_TOTAL)
+        items.append(MD.media_item("audio", MD.data_uri(out.read_bytes(), "wav"), "reference_audio"))
+    if "speech_guide" in wf:
+        notes.append("This clip used a lip-sync speech track. The API has no input for it; the "
+                      "speech is already in the clip's soundtrack.")
+    return text.strip(), items, notes
+
+
+def _usage_cost(rec: dict, usage: dict) -> Optional[float]:
+    secs = usage.get("output_seconds") or usage.get("total_seconds")
+    if not secs:
+        return None
+    if rec.get("kind") == "regeneration":
+        return round(MD.REGEN_PRICE_PER_SECOND * secs, 3)
+    rate = MD.PRICE_PER_SECOND.get((rec.get("model"), rec.get("resolution")))
+    if rate is None:
+        return None
+    extra_img = max(0, (usage.get("input_image_count") or 0) - MD.FREE_IMAGES) * MD.EXTRA_IMAGE_PRICE
+    return round(rate * (secs + (usage.get("input_seconds") or 0)) + extra_img, 3)
+
+
+async def _api_fetch(job_id: str, task: dict) -> None:
+    rec = load_job(job_id)
+    task_id = job_id[len(API_PREFIX):]
+    fn = f"MiniMax_API_{task.get('resolution') or rec.get('resolution') or ''}_{task_id}.mp4"
+    dest = _output_path(API_SUB, fn)
+    await video_api.download(task["content"]["url"], dest)
+    if rec.get("keep_original_audio") and rec.get("source_file"):
+        src = _output_path(*rec["source_file"])
+        mixed = dest.with_name(dest.stem + "_mix.mp4")
+        try:
+            await MD.replace_audio(dest, src, mixed)
+            mixed.replace(dest)
+            rec["audio"] = "original soundtrack of the source clip kept"
+        except Exception as e:
+            rec["audio"] = f"could not keep the original soundtrack ({e}); MiniMax audio used"
+    usage = task.get("usage") or {}
+    rec.update(local_file=[API_SUB, fn], usage=usage, finished=time.time(),
+               cost_usd=_usage_cost(rec, usage))
+    save_job(job_id, rec)
+
+
+def _api_done(job_id: str, rec: dict) -> dict:
+    sub, fn = rec["local_file"]
+    out = {"job_id": job_id, "status": "done", "tool": rec.get("mode"),
+           "outputs": [{"type": "video", "filename": fn, "url": download_url(sub, fn)}]}
+    for k in ("resolution", "duration_seconds", "cost_usd", "audio"):
+        if rec.get(k) is not None:
+            out[k] = rec[k]
+    return out
+
+
+async def api_job_status(job_id: str) -> dict:
+    rec = load_job(job_id)
+    if rec.get("local_file") and _output_path(*rec["local_file"]).is_file():
+        return _api_done(job_id, rec)
+    if not video_api:
+        return {"job_id": job_id, "status": "error", "error": "MINIMAX_API_KEY is not configured on the server"}
+    try:
+        task = await video_api.query(job_id[len(API_PREFIX):])
+    except MD.APIError as e:
+        return {"job_id": job_id, "status": "error", "error": str(e)}
+    except httpx.HTTPError as e:
+        return {"job_id": job_id, "status": "running", "note": f"could not reach MiniMax right now ({e}); try again"}
+    s = task.get("status")
+    if s in ("queued", "running"):
+        return {"job_id": job_id, "status": s, "tool": rec.get("mode")}
+    if s in ("failed", "cancelled"):
+        err = task.get("error") or {}
+        return {"job_id": job_id, "status": "error",
+                "error": f"MiniMax task {s}: {err.get('message') or err.get('code') or 'no details'}"}
+    if s != "succeeded":
+        return {"job_id": job_id, "status": "unknown", "note": f"unexpected MiniMax status {s!r}"}
+    if not (task.get("content") or {}).get("url"):
+        return {"job_id": job_id, "status": "error", "error": "MiniMax finished but returned no video URL"}
+    t = _api_downloads.get(job_id)
+    if t is not None and t.done():
+        _api_downloads.pop(job_id, None)
+        if t.exception():
+            return {"job_id": job_id, "status": "error",
+                    "error": f"download failed: {t.exception()} (call get_job again to retry)"}
+        return _api_done(job_id, load_job(job_id))
+    if t is None:
+        _api_downloads[job_id] = asyncio.create_task(_api_fetch(job_id, task))
+    return {"job_id": job_id, "status": "running", "note": "MiniMax finished; downloading the video to this server"}
+
+
+@mcp.tool()
+async def api_video(
+    prompt: str,
+    first_frame_image: Optional[str] = None,
+    last_frame_image: Optional[str] = None,
+    reference_images: Optional[list[str]] = None,
+    reference_audios: Optional[list[str]] = None,
+    reference_videos: Optional[list[str]] = None,
+    model: Literal["MiniMax-H3", "MiniMax-H3-Max"] = "MiniMax-H3",
+    resolution: Literal["480P", "768P", "2K"] = "768P",
+    duration_seconds: int = 5,
+    aspect_ratio: Literal["16:9", "9:16", "1:1", "4:3", "3:4", "21:9"] = "16:9",
+    prompt_expansion: Literal["disabled", "balanced", "quality"] = "disabled",
+    confirm_code: Optional[str] = None,
+) -> dict:
+    """Render a video with audio on MiniMax's cloud H3 (direct API). COSTS REAL MONEY per second.
+
+    Two-step: the first call returns status 'needs_confirmation' with the estimated cost and a
+    confirm_code (nothing is sent). Show the cost to the user, and only after they agree call
+    again with the same arguments + confirm_code. Then poll get_job(job_id) ('api:...').
+    Prices (Oct 2026 list): H3 768P $0.08/s, H3 2K $0.13/s, H3-Max 480P $0.05/s, 768P $0.08/s.
+
+    Modes (cannot be mixed): text only; image-to-video (first_frame_image, optional
+    last_frame_image); reference (1-9 reference_images, 0-3 reference_videos 2-15 s each,
+    0-3 reference_audios 2-15 s each, 15 s total each kind; audio needs an image or video).
+    Images/audio: image_id ("asset:..."), URL from this server, any http(s) URL, data URI, base64.
+    reference_videos: job_id or URL of a clip from this server, or an http(s) URL.
+    reference_audios only set a voice TIMBRE; the API cannot lip-sync to an exact speech track
+    (do that on the local GPU with speech_audio). The API has no seed: every call is a new take.
+    model: MiniMax-H3 (768P / 2K, 4-15 s) or MiniMax-H3-Max (faster, 480P / 768P, 5-15 s).
+    aspect_ratio: used for text-only and reference mode; image mode follows the image.
+    prompt_expansion: H3-Max only; 'disabled' keeps your structured prompt exactly.
+    Same prompt format as the local tools (see prompt_guide)."""
+    if not video_api:
+        return {"status": "error", "error": "MINIMAX_API_KEY is not configured on the server"}
+    prompt = (prompt or "").strip()
+    if not prompt or len(prompt) > 7000:
+        return {"status": "error", "error": "prompt must be 1-7000 characters"}
+    imgs = [x for x in (reference_images or []) if x]
+    auds = [x for x in (reference_audios or []) if x]
+    vids = [x for x in (reference_videos or []) if x]
+    i2v, r2v = bool(first_frame_image or last_frame_image), bool(imgs or auds or vids)
+    if i2v and r2v:
+        return {"status": "error", "error": "first/last frame and reference inputs cannot be mixed (API rule)"}
+    if last_frame_image and not first_frame_image:
+        return {"status": "error", "error": "last_frame_image needs first_frame_image too"}
+    if len(imgs) > 9 or len(auds) > 3 or len(vids) > 3:
+        return {"status": "error", "error": "at most 9 reference images, 3 audios and 3 videos"}
+    if auds and not (imgs or vids):
+        return {"status": "error", "error": "reference audio needs at least one reference image or video"}
+    d = int(round(float(duration_seconds)))
+    problem = MD.check_model(model, resolution, d)
+    if problem:
+        return {"status": "error", "error": problem}
+    mode = "image_to_video" if i2v else "reference_to_video" if r2v else "text_to_video"
+    args = {"prompt": prompt, "first": first_frame_image, "last": last_frame_image, "imgs": imgs,
+            "auds": auds, "vids": vids, "model": model, "resolution": resolution, "duration": d,
+            "ratio": aspect_ratio, "expansion": prompt_expansion}
+    code = _confirm_code("api_video", args)
+
+    content, vid_seconds = [MD.text_item(prompt)], 0.0
+    try:
+        if first_frame_image:
+            content.append(MD.media_item("image", await _api_image(first_frame_image), "first_frame"))
+        if last_frame_image:
+            content.append(MD.media_item("image", await _api_image(last_frame_image), "last_frame"))
+        for s in imgs:
+            content.append(MD.media_item("image", await _api_image(s), "reference_image"))
+        for s in vids:
+            path = await _video_path_any(s)
+            info = await MD.probe(path)
+            vs = info.get("duration") or 0.0
+            if not MD.REF_VIDEO_MIN <= vs <= MD.REF_VIDEO_TOTAL:
+                raise ValueError(f"reference video is {vs:.1f} s; each must be 2-15 s")
+            vid_seconds += vs
+            parsed = _parse_server_url(s) or None
+            try:
+                v = await find_video(s)
+                parsed = (v["sub"], v["filename"])
+            except Exception:
+                pass
+            content.append(MD.media_item("video", await _api_video_source(path, parsed), "reference_video"))
+        if vid_seconds > MD.REF_VIDEO_TOTAL:
+            raise ValueError(f"reference videos total {vid_seconds:.1f} s; the limit is 15 s")
+        if auds:
+            content.extend(await _api_reference_audios(auds))
+    except Exception as e:
+        return {"status": "error", "error": f"could not prepare inputs: {e}"}
+
+    body = {"model": model, "content": content, "resolution": resolution, "duration": d,
+            "ratio": "adaptive" if i2v else aspect_ratio}
+    if model == "MiniMax-H3-Max":
+        body["extra"] = {"prompt_expansion_mode": prompt_expansion}
+    if MD.body_size(body) > MD.MAX_BODY_BYTES:
+        return {"status": "error", "error": "inputs are larger than the API's 64 MB request limit; use fewer or smaller files"}
+    n_images = sum(1 for c in content if c.get("type") == "image_url")
+    summary = {"tool": "api_video", "mode": mode, "model": model, "resolution": resolution,
+               "duration_seconds": d,
+               **MD.estimate_generation(model, resolution, d, n_images, round(vid_seconds, 2))}
+    if confirm_code != code:
+        return _needs_confirmation(code, summary)
+    try:
+        task_id = await video_api.create(body)
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    job_id = API_PREFIX + task_id
+    save_job(job_id, {"job_id": job_id, "kind": "generation", "created": time.time(),
+                      "request": body, **summary})
+    return {"job_id": job_id, "status": "queued", **summary,
+            "note": "Rendering on MiniMax's cloud (usually a few minutes). Poll get_job(job_id)."}
+
+
+@mcp.tool()
+async def upscale_to_2k(
+    video: str,
+    keep_original_audio: Optional[bool] = None,
+    prompt: Optional[str] = None,
+    confirm_code: Optional[str] = None,
+) -> dict:
+    """Turn a finished 768P H3 clip into 2K with MiniMax's regeneration API (~$0.05 per
+    second, e.g. 5 s = $0.25). The picture and motion stay the clip you chose.
+    COSTS REAL MONEY: the first call checks the clip and returns the estimated cost and a
+    confirm_code (nothing is sent). Show it to the user; after they agree call again with the
+    same arguments + confirm_code. Then poll get_job(job_id) ('api:...').
+
+    video: job_id of a local H3 job (best), a video URL returned by this server, or the job_id
+      of an api_video 768P render. The clip must be quality 'standard' or 'high' (not 'draft'),
+      4-15 s long, made by this server (24 fps, with audio). The exact prompt and the
+      first-frame/reference inputs it was rendered with are sent automatically.
+    keep_original_audio: put the source clip's soundtrack on the 2K result (default: yes for
+      lip-sync clips made with speech_audio, otherwise keep MiniMax's audio).
+    prompt: only needed when the server no longer knows how the clip was made."""
+    if not video_api:
+        return {"status": "error", "error": "MINIMAX_API_KEY is not configured on the server"}
+    try:
+        v = await find_video(video)
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    path = v["path"]
+    if not path.is_file():
+        return {"status": "error", "error": f"{v['filename']} is no longer on this server"}
+    try:
+        info = await MD.probe(path)
+    except Exception as e:
+        return {"status": "error", "error": f"could not read the clip: {e}"}
+    problems = MD.regen_spec_problems(info)
+    if problems:
+        return {"status": "error", "error": "this clip cannot be upscaled: " + "; ".join(problems),
+                "clip": {k: info.get(k) for k in ("width", "height", "fps", "frames", "has_audio")}}
+    rec, wf, notes = v.get("record") or {}, v.get("workflow"), []
+    try:
+        if rec.get("kind") == "generation":
+            if rec.get("resolution") != "768P":
+                return {"status": "error", "error": "only 768P clips can be upscaled"}
+            content = list(rec["request"]["content"])
+        elif wf:
+            text, items, notes = await _regen_inputs_from_workflow(wf)
+            if prompt and prompt.strip() != text:
+                notes.append("prompt argument ignored: the exact prompt the clip was rendered with is used")
+            content = [MD.text_item(text), *items]
+        elif prompt and prompt.strip():
+            content = [MD.text_item(prompt.strip())]
+            notes.append("The server does not know how this clip was made, so only the prompt is sent. "
+                         "It must be the exact prompt, and clips made from a first frame or references "
+                         "may come out worse.")
+        else:
+            return {"status": "error", "error": "the server does not know how this clip was made; pass its exact prompt"}
+        content.append(MD.media_item("video", await _api_video_source(path, (v["sub"], v["filename"])),
+                                     "base_video"))
+    except Exception as e:
+        return {"status": "error", "error": f"could not prepare inputs: {e}"}
+    body = {"model": "MiniMax-H3", "content": content, "resolution": "2K"}
+    if MD.body_size(body) > MD.MAX_BODY_BYTES:
+        return {"status": "error", "error": "inputs are larger than the API's 64 MB request limit"}
+    lip = bool(wf and "speech_guide" in wf)
+    keep = lip if keep_original_audio is None else bool(keep_original_audio)
+    seconds = round(info["frames"] / MD.REGEN_FPS, 2)
+    summary = {"tool": "upscale_to_2k", "mode": "regenerate_2k", "source": v["filename"],
+               "source_size": f"{info['width']}x{info['height']}", "duration_seconds": seconds,
+               "keep_original_audio": keep, **MD.estimate_regeneration(seconds)}
+    if notes:
+        summary["notes"] = notes
+    code = _confirm_code("upscale_to_2k", {"src": [v["sub"], v["filename"]], "keep": keep,
+                                           "prompt": (prompt or "").strip()})
+    if confirm_code != code:
+        return _needs_confirmation(code, summary)
+    try:
+        task_id = await video_api.regenerate(body)
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    job_id = API_PREFIX + task_id
+    save_job(job_id, {"job_id": job_id, "kind": "regeneration", "created": time.time(),
+                      "resolution": "2K", "source_file": [v["sub"], v["filename"]], **summary})
+    return {"job_id": job_id, "status": "queued", **summary,
+            "note": "Upscaling on MiniMax's cloud (usually a few minutes). Poll get_job(job_id)."}
+
+
+@mcp.tool()
+async def extract_frame(
+    video: str,
+    position: Literal["first", "last", "time"] = "last",
+    time_seconds: float = 0.0,
+) -> dict:
+    """Grab one frame of a clip as a PNG and a reusable image_id ("asset:...").
+    Continuity: the LAST frame of shot N as the image / first_frame_image of shot N+1. Also to
+    pick a frame from a draft and use it as first_frame_image for api_video.
+    video: job_id (local or 'api:...'), a video URL returned by this server, or any http(s) video.
+    position: first, last, or time (then time_seconds from the start)."""
+    try:
+        path = await _video_path_any(video)
+        if not path.is_file():
+            return {"status": "error", "error": "the video file is no longer on this server"}
+        tag = f"t{time_seconds:g}" if position == "time" else position
+        fn = f"frame_{path.stem[:40]}_{tag}_{uuid.uuid4().hex[:4]}.png"
+        dest = _output_path("frames", fn)
+        await MD.extract_frame(path, dest, position, time_seconds)
+        data = dest.read_bytes()
+        name = await upload_image_bytes(data, "png", f"frame_{path.stem[:24]}_{tag}")
+    except Exception as e:
+        return {"status": "error", "error": f"could not extract the frame: {e}"}
+    out = {"status": "done", "image_id": f"{ASSET_PREFIX}{name}", "url": download_url("frames", fn)}
+    size = image_size(data)
+    if size:
+        out["width"], out["height"] = size
+    return out
 
 
 PROMPT_GUIDE = """MiniMax H3 prompt guide (official structured format; the hosted MiniMax
@@ -892,7 +1472,21 @@ async def server_status() -> dict:
             "vram_total_gb": round((dev.get("vram_total") or 0) / 1e9, 1),
             "jobs_running": len(q.get("queue_running", [])),
             "jobs_queued": len(q.get("queue_pending", [])),
-            "speech_enabled": bool(MINIMAX_API_KEY)}
+            "speech_enabled": bool(MINIMAX_API_KEY),
+            "cloud_video_enabled": bool(video_api),
+            "cloud_spend_usd": _cloud_spend(),
+            "ffmpeg": bool(MD.ffmpeg_exe())}
+
+
+def _cloud_spend() -> float:
+    """Approximate MiniMax video spend on this machine (list price x reported usage)."""
+    total = 0.0
+    for p in JOBS_DIR.glob("api_*.json"):
+        try:
+            total += json.loads(p.read_text()).get("cost_usd") or 0.0
+        except Exception:
+            pass
+    return round(total, 3)
 
 
 @mcp.custom_route("/health", methods=["GET"])

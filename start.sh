@@ -11,7 +11,7 @@ if [ ! -x "$DIR/venv/bin/python" ]; then
   echo "[setup] creating venv..."
   python3 -m venv "$DIR/venv"
   "$DIR/venv/bin/pip" install -q --upgrade pip
-  "$DIR/venv/bin/pip" install -q "mcp>=1.12,<2" httpx pillow uvicorn
+  "$DIR/venv/bin/pip" install -q "mcp>=1.12,<2" httpx pillow uvicorn imageio-ffmpeg
 fi
 
 # 2) Access token (created once, kept private)
