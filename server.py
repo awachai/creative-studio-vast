@@ -1083,16 +1083,7 @@ async def _regen_inputs_from_workflow(wf: dict) -> tuple[str, list[dict], list[s
 
 
 def _usage_cost(rec: dict, usage: dict) -> Optional[float]:
-    secs = usage.get("output_seconds") or usage.get("total_seconds")
-    if not secs:
-        return None
-    if rec.get("kind") == "regeneration":
-        return round(MD.REGEN_PRICE_PER_SECOND * secs, 3)
-    rate = MD.PRICE_PER_SECOND.get((rec.get("model"), rec.get("resolution")))
-    if rate is None:
-        return None
-    extra_img = max(0, (usage.get("input_image_count") or 0) - MD.FREE_IMAGES) * MD.EXTRA_IMAGE_PRICE
-    return round(rate * (secs + (usage.get("input_seconds") or 0)) + extra_img, 3)
+    return MD.cost_from_usage(rec.get("kind"), rec.get("model"), rec.get("resolution"), usage)
 
 
 async def _api_fetch(job_id: str, task: dict) -> None:
@@ -1258,7 +1249,7 @@ async def api_video(
         return {"status": "error", "error": "inputs are larger than the API's 64 MB request limit; use fewer or smaller files"}
     n_images = sum(1 for c in content if c.get("type") == "image_url")
     summary = {"tool": "api_video", "mode": mode, "model": model, "resolution": resolution,
-               "duration_seconds": d,
+               "duration_seconds": d, "reference_video_seconds": round(vid_seconds, 2),
                **MD.estimate_generation(model, resolution, d, n_images, round(vid_seconds, 2))}
     if confirm_code != code:
         return _needs_confirmation(code, summary)
@@ -1338,9 +1329,11 @@ async def upscale_to_2k(
     lip = bool(wf and "speech_guide" in wf)
     keep = lip if keep_original_audio is None else bool(keep_original_audio)
     seconds = round(info["frames"] / MD.REGEN_FPS, 2)
+    n_img = sum(1 for c in content if c.get("type") == "image_url")
     summary = {"tool": "upscale_to_2k", "mode": "regenerate_2k", "source": v["filename"],
                "source_size": f"{info['width']}x{info['height']}", "duration_seconds": seconds,
-               "keep_original_audio": keep, **MD.estimate_regeneration(seconds)}
+               "keep_original_audio": keep,
+               **MD.estimate_regeneration(seconds, n_img, rec.get("reference_video_seconds") or 0.0)}
     if notes:
         summary["notes"] = notes
     code = _confirm_code("upscale_to_2k", {"src": [v["sub"], v["filename"]], "keep": keep,

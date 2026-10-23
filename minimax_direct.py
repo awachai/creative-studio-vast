@@ -29,9 +29,17 @@ PRICE_PER_SECOND = {
     ("MiniMax-H3-Max", "480P"): 0.05,
     ("MiniMax-H3-Max", "768P"): 0.08,
 }
-REGEN_PRICE_PER_SECOND = 0.05      # 768P -> 2K regeneration
-FREE_IMAGES = 5                    # first/last/reference images: first 5 free
-EXTRA_IMAGE_PRICE = 0.04           # per image after that
+REGEN_PRICE_PER_SECOND = 0.05      # 768P -> 2K regeneration, per second of output
+# Input materials: (free images, price per extra image) and reference-video price per second.
+# Regeneration bills the original task's input materials again at its own rates.
+IMAGE_PRICING = {"MiniMax-H3": (5, 0.04), "MiniMax-H3-Max": (2, 0.074), "regeneration": (5, 0.025)}
+REF_VIDEO_PER_SECOND = {
+    ("MiniMax-H3", "768P"): 0.08,
+    ("MiniMax-H3", "2K"): 0.13,
+    ("MiniMax-H3-Max", "480P"): 0.0553,
+    ("MiniMax-H3-Max", "768P"): 0.143,
+    ("regeneration", "2K"): 0.05,
+}
 MODEL_RESOLUTIONS = {"MiniMax-H3": ("768P", "2K"), "MiniMax-H3-Max": ("480P", "768P")}
 MODEL_DURATION = {"MiniMax-H3": (4, 15), "MiniMax-H3-Max": (5, 15)}
 
@@ -67,23 +75,46 @@ def check_model(model: str, resolution: str, duration: int) -> Optional[str]:
     return None
 
 
-def estimate_generation(model: str, resolution: str, duration: int, image_count: int = 0,
-                        reference_video_seconds: float = 0.0) -> dict:
-    rate = PRICE_PER_SECOND[(model, resolution)]
-    parts = {f"video {duration} s x ${rate}/s ({model} {resolution})": rate * duration}
-    extra = max(0, image_count - FREE_IMAGES)
+def _inputs(parts: dict, key: str, resolution: str, image_count: int, ref_video_seconds: float) -> None:
+    free, each = IMAGE_PRICING[key]
+    extra = max(0, image_count - free)
     if extra:
-        parts[f"{extra} images beyond the first {FREE_IMAGES} x ${EXTRA_IMAGE_PRICE}"] = extra * EXTRA_IMAGE_PRICE
-    if reference_video_seconds:
-        parts[f"reference video {reference_video_seconds:.1f} s x ${rate}/s"] = rate * reference_video_seconds
+        parts[f"{extra} images beyond the first {free} x ${each}"] = extra * each
+    if ref_video_seconds:
+        rate = REF_VIDEO_PER_SECOND[(key, resolution)]
+        parts[f"reference video {ref_video_seconds:.1f} s x ${rate}/s"] = rate * ref_video_seconds
+
+
+def _result(parts: dict) -> dict:
     return {"estimated_cost_usd": round(sum(parts.values()), 3),
             "breakdown": {k: round(v, 3) for k, v in parts.items()}}
 
 
-def estimate_regeneration(seconds: float) -> dict:
-    cost = REGEN_PRICE_PER_SECOND * seconds
-    return {"estimated_cost_usd": round(cost, 3),
-            "breakdown": {f"2K regeneration {seconds:.2f} s x ${REGEN_PRICE_PER_SECOND}/s": round(cost, 3)}}
+def estimate_generation(model: str, resolution: str, duration: int, image_count: int = 0,
+                        reference_video_seconds: float = 0.0) -> dict:
+    rate = PRICE_PER_SECOND[(model, resolution)]
+    parts = {f"video {duration} s x ${rate}/s ({model} {resolution})": rate * duration}
+    _inputs(parts, model, resolution, image_count, reference_video_seconds)
+    return _result(parts)
+
+
+def estimate_regeneration(seconds: float, image_count: int = 0, reference_video_seconds: float = 0.0) -> dict:
+    parts = {f"2K regeneration {seconds:.2f} s x ${REGEN_PRICE_PER_SECOND}/s": REGEN_PRICE_PER_SECOND * seconds}
+    _inputs(parts, "regeneration", "2K", image_count, reference_video_seconds)
+    return _result(parts)
+
+
+def cost_from_usage(kind: str, model: Optional[str], resolution: Optional[str], usage: dict) -> Optional[float]:
+    """List-price cost of a finished task from the usage MiniMax reports (approximate)."""
+    secs = usage.get("output_seconds") or usage.get("total_seconds")
+    if not secs:
+        return None
+    imgs, vid = usage.get("input_image_count") or 0, usage.get("input_seconds") or 0
+    if kind == "regeneration":
+        return estimate_regeneration(secs, imgs, vid)["estimated_cost_usd"]
+    if (model, resolution) not in PRICE_PER_SECOND:
+        return None
+    return estimate_generation(model, resolution, secs, imgs, vid)["estimated_cost_usd"]
 
 
 def regen_spec_problems(info: dict) -> list[str]:
