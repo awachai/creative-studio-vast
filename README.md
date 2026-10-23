@@ -64,3 +64,30 @@
 - แก้โค้ดแล้ว: `bash /workspace/h3-mcp/restart_server.sh`
 - ทดสอบ: `cd /workspace/h3-mcp && venv/bin/python test_client.py --full` (`--voice` = ทดสอบเสียงพูด + ปากขยับตาม)
 - ห้ามเปิดเผยไฟล์ `token`, `minimax.env`, `oauth_state.json`
+
+## MiniMax Direct บนคอมตัวเอง (ไม่ต้องเช่าเครื่อง)
+
+`local/minimax_direct_mcp.py` คือ MCP ขนาดเล็กที่รันในแอป Claude บนคอม เรียก MiniMax H3 ตรงจาก API
+
+| เครื่องมือ | ทำอะไร |
+|---|---|
+| `generate_video` | H3 768P (ค่าเริ่มต้น) / 2K, H3-Max 480P / 768P — ข้อความ, เฟรมแรก/สุดท้าย, ภาพ/วิดีโอ/เสียงอ้างอิง |
+| `upscale_to_2k` | คลิป 768P (งานจาก `generate_video` หรือไฟล์ที่ทำบนเครื่องเช่า) → 2K ภาพเดิม |
+| `get_job`, `list_jobs` | เช็กงาน, ดาวน์โหลดผลลงโฟลเดอร์, ดูยอดใช้จ่าย |
+| `extract_frame` | ดึงเฟรมเป็นไฟล์ PNG |
+| `prompt_guide` | รูปแบบ prompt ทางการของ H3 |
+
+ติดตั้ง:
+1. วาง `minimax_direct.py` และ `local/minimax_direct_mcp.py` ไว้โฟลเดอร์เดียวกัน แล้ว `pip install "mcp>=1.12,<2" httpx imageio-ffmpeg`
+2. เพิ่มใน `claude_desktop_config.json`:
+   ```json
+   "minimax-direct": {
+     "command": "C:\\...\\python.exe",
+     "args": ["C:\\...\\minimax-direct\\minimax_direct_mcp.py"],
+     "env": {"MINIMAX_OUTPUT_DIR": "C:\\...\\MiniMax-Direct"}
+   }
+   ```
+3. ใส่ API key บรรทัดเดียวในไฟล์ `%USERPROFILE%\.minimax\api_key.txt` (ไม่ต้องใส่ในไฟล์ config)
+4. ปิดแอป Claude ให้สนิท (จาก system tray) แล้วเปิดใหม่
+
+งานที่เสียเงินต้องยืนยันด้วย `confirm_code` จากการเรียกครั้งแรกเสมอ
