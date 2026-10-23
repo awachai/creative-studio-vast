@@ -76,6 +76,7 @@
 | `get_job`, `list_jobs` | เช็กงาน, ดาวน์โหลดผลลงโฟลเดอร์, ดูยอดใช้จ่าย |
 | `extract_frame` | ดึงเฟรมเป็นไฟล์ PNG |
 | `prompt_guide` | รูปแบบ prompt ทางการของ H3 |
+| `text_to_speech`, `list_voices`, `design_voice` | เสียงพูด MiniMax Speech (ตัวเลือกเหมือนบนเครื่องเช่า + แท็ก (laughs) (sighs)) บันทึกไฟล์ลง `MiniMax-Direct\audio` |
 
 ติดตั้ง:
 1. วาง `minimax_direct.py` และ `local/minimax_direct_mcp.py` ไว้โฟลเดอร์เดียวกัน แล้ว `pip install "mcp>=1.12,<2" httpx imageio-ffmpeg`

@@ -2,7 +2,8 @@
 MiniMax Direct — a small local MCP server (stdio) for the Claude desktop app.
 MiniMax H3 video straight from MiniMax's API on your own computer; no rented GPU needed.
 
-Tools: generate_video, upscale_to_2k, get_job, list_jobs, extract_frame, prompt_guide
+Tools: generate_video, upscale_to_2k, get_job, list_jobs, extract_frame, prompt_guide,
+       text_to_speech, list_voices, design_voice
 Inputs are files on this computer (full path, or a path relative to the output folder) or
 http(s) URLs. Results are saved into MINIMAX_OUTPUT_DIR.
 
@@ -214,7 +215,10 @@ mcp = FastMCP("minimax-direct", instructions=(
     "until done; results are saved as files on this computer (paths are returned). "
     "Inputs are file paths on this computer. Default is 768P. The API has no seed and no lip-sync "
     "to an exact speech track; reference audio only sets a voice timbre. "
-    "upscale_to_2k turns a chosen 768P H3 clip into 2K with the same picture (~$0.05/s)."))
+    "upscale_to_2k turns a chosen 768P H3 clip into 2K with the same picture (~$0.05/s). "
+    "Speech: text_to_speech (MiniMax Speech, billed per character, no confirm step), list_voices, "
+    "design_voice. A speech file can be used as a reference_audios voice sample; speech-2.8 models "
+    "understand sound tags such as (laughs), (sighs), (gasps) inside the text."))
 
 
 @mcp.tool()
@@ -509,6 +513,152 @@ async def extract_frame(video: str, position: Literal["first", "last", "time"] =
     except Exception as e:
         return {"status": "error", "error": str(e)}
     return {"status": "done", "file": str(dest)}
+
+
+# ---------------------------------------------------------------------------
+# MiniMax Speech (text to speech, voices) — same options as the GPU server's tools
+# ---------------------------------------------------------------------------
+async def _speech_call(path: str, body: dict) -> dict:
+    key = api_key()
+    if not key:
+        raise RuntimeError(f"no MiniMax API key yet: paste it as one line into {HOME / 'api_key.txt'}")
+    async with httpx.AsyncClient(timeout=180) as c:
+        r = await c.post(f"{BASE.rstrip('/')}{path}", json=body, headers={"Authorization": f"Bearer {key}"})
+    try:
+        j = r.json()
+    except Exception:
+        raise RuntimeError(f"MiniMax HTTP {r.status_code}: {r.text[:300]}")
+    base = j.get("base_resp") or {}
+    if base.get("status_code", 0) != 0:
+        raise RuntimeError(f"MiniMax error {base.get('status_code')}: {base.get('status_msg')}")
+    return j
+
+
+@mcp.tool()
+async def text_to_speech(
+    text: str,
+    voice_id: Optional[str] = None,
+    language: Optional[str] = "Thai",
+    model: Literal["speech-2.8-hd", "speech-2.8-turbo", "speech-2.6-hd", "speech-2.6-turbo"] = "speech-2.8-hd",
+    speed: float = 1.0,
+    pitch: int = 0,
+    emotion: Optional[Literal["happy", "sad", "angry", "fearful", "disgusted",
+                              "surprised", "calm", "fluent"]] = None,
+    audio_format: Literal["mp3", "wav", "flac"] = "mp3",
+    volume: float = 1.0,
+    deepen_lighten: int = 0,
+    stronger_softer: int = 0,
+    nasal_crisp: int = 0,
+    sound_effect: Optional[Literal["spacious_echo", "auditorium_echo", "lofi_telephone", "robotic"]] = None,
+    voice_mix: Optional[list[dict]] = None,
+    name: Optional[str] = None,
+) -> dict:
+    """Text to speech with MiniMax Speech (billed per character, e.g. speech-2.8-hd $100 per
+    million characters). Saves an audio file on this computer and returns its path.
+
+    text: up to 10,000 characters. Pauses: <#0.5#> (seconds). speech-2.8 models also perform
+      sound tags such as (laughs), (chuckles), (sighs), (gasps), (coughs) placed in the text.
+    voice_id: from list_voices (e.g. Thai_female_1_sample1, Warm-HeartedAunt) or design_voice.
+    language: language boost, e.g. "Thai", "English", "Japanese", or "auto".
+    speed 0.5-2, pitch -12..12 (semitones), volume 0.1-10.
+    Voice modifier, each -100..100 (0 = unchanged): deepen_lighten (- deeper, + lighter),
+      stronger_softer (- stronger, + softer), nasal_crisp (- nasal, + crisper).
+    sound_effect: spacious_echo, auditorium_echo, lofi_telephone, robotic.
+    voice_mix: blend 2-4 voices instead of voice_id, e.g.
+      [{"voice_id": "Thai_female_1_sample1", "weight": 70}, {"voice_id": "English_PlayfulGirl", "weight": 30}].
+    name: optional file name prefix, e.g. 'Nori_laugh'."""
+    text = (text or "").strip()
+    if not text or len(text) > 10000:
+        return {"status": "error", "error": "text must be 1-10,000 characters"}
+    clamp = lambda v, lo, hi: max(lo, min(hi, v))
+    mix = [{"voice_id": str(m["voice_id"]), "weight": clamp(int(m.get("weight", 50)), 1, 100)}
+           for m in (voice_mix or []) if isinstance(m, dict) and m.get("voice_id")]
+    if voice_mix and not 2 <= len(mix) <= 4:
+        return {"status": "error", "error": "voice_mix needs 2-4 entries like {voice_id, weight}"}
+    if not mix and not voice_id:
+        return {"status": "error", "error": "choose a voice_id (see list_voices) or a voice_mix"}
+    voice = {"voice_id": "" if mix else voice_id, "speed": clamp(float(speed), 0.5, 2.0),
+             "vol": clamp(float(volume), 0.1, 10.0), "pitch": clamp(int(pitch), -12, 12)}
+    if emotion:
+        voice["emotion"] = emotion
+    body = {"model": model, "text": text, "stream": False, "voice_setting": voice, "output_format": "hex",
+            "audio_setting": {"sample_rate": 32000, "bitrate": 128000, "format": audio_format, "channel": 1}}
+    if mix:
+        body["timbre_weights"] = mix
+    modify = {k: clamp(int(v), -100, 100) for k, v in
+              (("pitch", deepen_lighten), ("intensity", stronger_softer), ("timbre", nasal_crisp)) if v}
+    if sound_effect:
+        modify["sound_effects"] = sound_effect
+    if modify:
+        body["voice_modify"] = modify
+    if language:
+        body["language_boost"] = language
+    try:
+        j = await _speech_call("/v1/t2a_v2", body)
+        audio = bytes.fromhex((j.get("data") or {}).get("audio") or "")
+        if not audio:
+            raise RuntimeError("MiniMax returned no audio")
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    dest = OUT / "audio" / f"{safe_name(name or 'MiniMax_Speech') or 'MiniMax_Speech'}_{time.strftime('%Y%m%d-%H%M%S')}.{audio_format}"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(audio)
+    extra = j.get("extra_info") or {}
+    out = {"status": "done", "file": str(dest),
+           "duration_seconds": round((extra.get("audio_length") or 0) / 1000, 2),
+           "characters_billed": extra.get("usage_characters"), "voice_id": voice["voice_id"] or None}
+    if mix:
+        out["voice_mix"] = mix
+    if modify:
+        out["voice_modify"] = modify
+    return out
+
+
+@mcp.tool()
+async def list_voices(search: Optional[str] = None, limit: int = 50) -> dict:
+    """List MiniMax voices (system voices plus your designed/cloned ones). search filters by
+    id/name/description, e.g. "Thai", "female", "aunt"."""
+    try:
+        j = await _speech_call("/v1/get_voice", {"voice_type": "all"})
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    voices = []
+    for group in ("system_voice", "voice_cloning", "voice_generation"):
+        for v in j.get(group) or []:
+            desc = v.get("description")
+            if isinstance(desc, list):
+                desc = " ".join(map(str, desc))
+            voices.append({"voice_id": v.get("voice_id"), "name": v.get("voice_name"),
+                           "description": desc, "kind": group})
+    if search:
+        s = search.lower()
+        voices = [v for v in voices if s in " ".join(str(x) for x in v.values()).lower()]
+    return {"count": len(voices), "voices": voices[: max(1, min(500, int(limit)))]}
+
+
+@mcp.tool()
+async def design_voice(description: str, preview_text: str, voice_id: Optional[str] = None) -> dict:
+    """Create a new custom voice from a description (MiniMax Voice Design), e.g. "Thai girl
+    around 12, bright and playful, quick giggly delivery". preview_text: a sample line (max 500
+    chars) in the target language. Returns the new voice_id and a preview audio file."""
+    if not (description or "").strip() or not (preview_text or "").strip():
+        return {"status": "error", "error": "description and preview_text are required"}
+    body = {"prompt": description.strip(), "preview_text": preview_text.strip()[:500]}
+    if voice_id:
+        body["voice_id"] = voice_id
+    try:
+        j = await _speech_call("/v1/voice_design", body)
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+    if not j.get("voice_id"):
+        return {"status": "error", "error": "MiniMax returned no voice_id"}
+    out = {"status": "done", "voice_id": j["voice_id"]}
+    if j.get("trial_audio"):
+        dest = OUT / "audio" / f"VoiceDesign_{safe_name(j['voice_id'])}_{time.strftime('%Y%m%d-%H%M%S')}.mp3"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(bytes.fromhex(j["trial_audio"]))
+        out["file"] = str(dest)
+    return out
 
 
 GUIDE = """MiniMax H3 prompt guide (official structured format). The API sends your text to the model
